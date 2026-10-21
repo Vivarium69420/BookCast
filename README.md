@@ -62,7 +62,8 @@ Workflow:
 3. **Cast** – edit names/genders/voices/pitch, merge or delete characters, audition a line.
    Changing a gender offers the first unused voice from that gender's pool; any voice can be overridden.
    **Quotes** below lists each dialogue line (optionally only uncertain ones) and lets you reassign it.
-4. **Run** – pick chapters, **Add to queue**, watch the jobs table/log/progress, download the MP3.
+4. **Run** – pick chapters, **Render / continue current book**, watch the jobs table/log/progress,
+   download the MP3. The Run tab shows which book it will render; saved chunks are reused automatically.
 
 ### Render queue
 
@@ -72,7 +73,11 @@ The Run tab runs a bounded queue instead of a single job:
   automatically; you can load and edit another book while renders run.
 - Every job keeps its own log (`runs/<slug>/logs/<job-id>.log`), progress, and output.
 - Select a row (or type its id / queue number) to show that job's status, log, audio, and download.
-- **Cancel selected** stops one job; **Cancel all** stops the queue; **Clear finished** tidies the table.
+- **Render / continue current book** applies to the book named at the top of the Run tab. It starts
+  now or waits for a slot, and resumes from saved chunks automatically.
+- **Continue selected job** re-queues a cancelled or failed job with its original settings, resuming
+  from its saved chunks. **Cancel selected job** stops one job; **Cancel all jobs** stops the queue;
+  **Clear finished jobs** tidies the table.
 - A book can only have one queued/running job. The UI also writes a PID lock in
   `runs/<slug>/work/.ui-job.json`, so two UI instances (or a UI restarted while a CLI render is
   still running) cannot write to the same workspace.

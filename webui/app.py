@@ -210,6 +210,37 @@ def _busy_reason() -> str:
     return ""
 
 
+def _current_book_md() -> str:
+    """Show exactly which book the Run tab will render.
+
+    ``Add to queue`` was ambiguous because the book is loaded on another tab.
+    Keeping this card visible makes the primary action self-explanatory.
+    """
+    book = S.get("book")
+    path = S.get("path")
+    if not book or not path:
+        return ("### No book loaded\n"
+                "Open the **Book** tab and load a book first. "
+                "The buttons below render that loaded book.")
+    if S.get("cast"):
+        n = len((S["cast"].get("characters") or {}))
+        cast_state = f"{n} character(s) ready"
+    elif S.get("ws") and store.cast_path(S["ws"]).exists():
+        cast_state = "cast file ready"
+    else:
+        cast_state = "no cast yet (Analyze on the Book tab)"
+    ws = S.get("ws")
+    workspace = f"`{ws.name}`" if ws else "—"
+    return (
+        f"### {book.title}\n"
+        f"`{Path(path).name}` · {len(book.chapters)} chapters · "
+        f"workspace {workspace}  \n"
+        f"Cast: {cast_state}. **Render / continue** starts this book or resumes "
+        f"its saved chunks. To discard those chunks, enable **Ignore saved "
+        f"progress** in Parameters → Output."
+    )
+
+
 def _invalidate(chapters) -> str:
     if _busy_reason():
         return ""
@@ -288,11 +319,13 @@ def _job_status(job) -> str:
     elif state == "stalled":
         lines.append(f"**Stalled** · no output for 5+ minutes · {snap['elapsed']:.0f}s")
     elif state == "cancelled":
-        lines.append(f"**Cancelled** · {snap['elapsed']:.0f}s — finished chunks are kept")
+        lines.append(f"**Cancelled** · {snap['elapsed']:.0f}s — finished chunks are kept. "
+                     f"Click **Continue selected job** to resume.")
     elif state == "done":
         lines.append(f"**Finished** (exit {snap['returncode']}) · {snap['elapsed']:.0f}s")
     else:
-        lines.append(f"**Failed** (exit {snap['returncode']}) · {snap['elapsed']:.0f}s")
+        lines.append(f"**Failed** (exit {snap['returncode']}) · {snap['elapsed']:.0f}s — "
+                     f"finished chunks are kept. Click **Continue selected job** to resume.")
 
     if snap["chapter_total"]:
         lines.append(f"Chapter {snap['chapter_index']}/{snap['chapter_total']}: "
@@ -300,7 +333,8 @@ def _job_status(job) -> str:
         lines.append(f"Chunk {snap['chunk_done']}/{snap['chunk_total']}")
     if state == "stalled":
         lines.append("⚠ **No output for 5+ minutes** — the TTS request may be stuck. "
-                     "Cancel this job and re-run; finished chunks are kept.")
+                     "Cancel this job, then click **Continue selected job**; finished "
+                     "chunks are kept.")
     if snap["error"] and not snap.get("cancelled"):
         lines.append(f"❌ `{snap['error']}`")
     outs = store.job_outputs(job.spec) if job.done else []
@@ -725,25 +759,26 @@ def on_enqueue(*args):
     extra = args[-2] if len(args) >= 2 else ""
     chapters = args[-1] if args else []
     rows = _jobs_rows()
+    book_md = _current_book_md()
     if not S["path"] or not S["ws"]:
-        return "Load a book first.", rows, 0.0, ""
+        return "Load a book first.", rows, 0.0, "", book_md
 
     workdir = S["ws"] / "work"
     busy = MANAGER.has_workspace(workdir)
     if busy:
         return (f"**Already {busy.state}** as job `{busy.spec.short()}`. "
-                f"Cancel it first, or wait for it to finish."), rows, 0.0, ""
+                f"Cancel it first, or wait for it to finish."), rows, 0.0, "", book_md
     pid = store.external_render_pid(workdir)
     if pid:
         return (f"**PID {pid} is already rendering this book.** "
-                f"Wait for it to finish (or stop that process) before queuing another."), rows, 0.0, ""
+                f"Wait for it to finish (or stop that process) before queuing another."), rows, 0.0, "", book_md
 
     if not store.cast_path(S["ws"]).exists():
         ok, msg = _analyze_now(values, extra)
         if not ok:
-            return f"**{msg}**", rows, 0.0, msg
+            return f"**{msg}**", rows, 0.0, msg, book_md
     if not store.cast_path(S["ws"]).exists():
-        return "No cast file — run Analyze first.", rows, 0.0, ""
+        return "No cast file — run Analyze first.", rows, 0.0, "", book_md
 
     per_chapter = bool(values.get("per_chapter"))
     out = store.out_path(S["ws"], per_chapter)
@@ -767,7 +802,7 @@ def on_enqueue(*args):
         job = MANAGER.enqueue(job_spec, cwd=ROOT,
                               log_path=store.job_log_path(S["ws"], job_spec.id))
     except Exception as exc:
-        return f"**Could not queue:** `{exc}`", rows, 0.0, ""
+        return f"**Could not queue:** `{exc}`", rows, 0.0, "", book_md
     SELECTED_JOB = job.id
     rows = _jobs_rows()
     if job.state == "queued":
@@ -778,19 +813,88 @@ def on_enqueue(*args):
     else:
         head = f"**Job `{job.spec.short()}` failed:** `{job.error}`"
     return (f"{head} Chapters: {spec or 'all'} · output `{out}`\n"
-            f"```\npython book_to_audio.py {shlex.join(argv)}\n```"), rows, 0.0, ""
+            f"```\npython book_to_audio.py {shlex.join(argv)}\n```"), rows, 0.0, "", book_md
+
+
+def on_continue_job(selector: str):
+    """Re-queue a cancelled/failed job using its original captured settings.
+
+    Renders are resumable, so the right recovery action after Cancel is to
+    continue the same job rather than make the user reconstruct it from the
+    Book and Parameters tabs.
+    """
+    global SELECTED_JOB
+    rows = _jobs_rows()
+    book_md = _current_book_md()
+    job = _resolve_job(selector)
+    if job is None:
+        return ("Select a **cancelled** or **failed** job in the table first.",
+                rows, 0.0, "", book_md)
+    if job.state in ("queued", "running", "stalled"):
+        return (f"Job `{job.spec.short()}` is already {job.state}; wait for it "
+                f"or cancel it first."), rows, 0.0, "", book_md
+
+    spec = job.spec
+    if not spec.workdir.exists():
+        return (f"No saved work folder for `{spec.short()}`. Use "
+                f"**Render / continue** to start this book from scratch."), \
+            rows, 0.0, "", book_md
+    if not spec.cast_file.exists():
+        return (f"Cast file for `{spec.short()}` is missing: `{spec.cast_file}`."), \
+            rows, 0.0, "", book_md
+    if not spec.book.exists():
+        return (f"Book for `{spec.short()}` is missing: `{spec.book}`."), \
+            rows, 0.0, "", book_md
+
+    busy = MANAGER.has_workspace(spec.workdir)
+    if busy:
+        return (f"This book is already {busy.state} as job `{busy.spec.short()}`."), \
+            rows, 0.0, "", book_md
+    pid = store.external_render_pid(spec.workdir)
+    if pid:
+        return (f"PID {pid} is already rendering this book. Wait for it to "
+                f"finish before continuing."), rows, 0.0, "", book_md
+
+    # A continue must resume, never replay a captured --fresh flag.
+    args = [a for a in spec.args
+            if a != "--fresh" and not a.startswith("--fresh=")]
+    new_spec = JobSpec(
+        book=spec.book, title=spec.title, cast_file=spec.cast_file,
+        workdir=spec.workdir, out_path=spec.out_path, args=args,
+        chapters=spec.chapters, per_chapter=spec.per_chapter,
+    )
+    if spec.per_chapter:
+        Path(spec.out_path).mkdir(parents=True, exist_ok=True)
+    ws = spec.workdir.parent
+    store.save_meta(ws, last_argv=args, chapters=spec.chapters,
+                    per_chapter=spec.per_chapter, last_job=new_spec.id)
+    try:
+        new_job = MANAGER.enqueue(new_spec, cwd=ROOT,
+                                  log_path=store.job_log_path(ws, new_spec.id))
+    except Exception as exc:
+        return f"**Could not continue:** `{exc}`", rows, 0.0, "", book_md
+    SELECTED_JOB = new_job.id
+    rows = _jobs_rows()
+    state = "Queued" if new_job.state == "queued" else "Started"
+    return (f"**{state}** `{new_spec.short()}` — continuing `{spec.short()}` "
+            f"from saved chunks · output `{spec.out_path}`"), \
+        rows, 0.0, "", book_md
 
 
 def on_cancel_job(selector: str):
+    global SELECTED_JOB
     job = _resolve_job(selector)
     if job is None:
         return "No job selected.", _jobs_rows()
+    SELECTED_JOB = job.id
     was_running = job.running
     ok = MANAGER.cancel(job.id)
     if not ok:
         return f"Job `{job.spec.short()}` is not queued or running.", _jobs_rows()
-    return (f"Cancelling `{job.spec.short()}`…" if was_running
-            else f"Removed `{job.spec.short()}` from the queue."), _jobs_rows()
+    if was_running:
+        return (f"Cancelling `{job.spec.short()}`… Saved chunks are kept — "
+                f"click **Continue selected job** to resume."), _jobs_rows()
+    return f"Removed `{job.spec.short()}` from the queue.", _jobs_rows()
 
 
 def on_cancel_all():
@@ -847,6 +951,7 @@ def on_tick():
     global SELECTED_JOB
     MANAGER.pump()
     rows = _jobs_rows()
+    book_md = _current_book_md()
     job = _selected_job()
     if job is None:
         msg = "Idle — queue empty."
@@ -856,10 +961,10 @@ def on_tick():
                 msg += (f"\n\n⚠ An external render (PID {pid}) is writing this book's "
                         f"workspace. It was started outside this queue; wait for it to "
                         f"finish before rendering this book here.")
-        return rows, msg, 0.0, "", gr.skip(), gr.skip()
+        return rows, msg, 0.0, "", gr.skip(), gr.skip(), book_md
     SELECTED_JOB = job.id
     status, pct, log, audio, download = _job_view(job)
-    return rows, status, pct, log, audio, download
+    return rows, status, pct, log, audio, download, book_md
 
 
 # --------------------------------------------------------------------------
@@ -1001,18 +1106,26 @@ with gr.Blocks(title="Book to Audio") as demo:
 
         # -------------------------------------------------------------- Run
         with gr.Tab("Run"):
+            run_book = gr.Markdown(_current_book_md())
             with gr.Row():
-                render_btn = gr.Button("Add to queue", variant="primary", scale=2)
-                cancel_btn = gr.Button("Cancel selected", variant="stop", scale=1)
-                cancel_all_btn = gr.Button("Cancel all", scale=1)
-                clear_btn = gr.Button("Clear finished", scale=1)
+                render_btn = gr.Button("Render / continue current book",
+                                       variant="primary", scale=3)
+                continue_btn = gr.Button("Continue selected job", scale=1)
+                cancel_btn = gr.Button("Cancel selected job", variant="stop", scale=1)
+            gr.Markdown("_**Render / continue** acts on the book shown above. It starts "
+                        "now, or waits if all parallel slots are busy. Saved chunks are "
+                        "reused automatically. **Continue selected job** re-queues a "
+                        "cancelled or failed job from the table below._")
             with gr.Row():
                 slots_dd = gr.Dropdown(label="Parallel renders", choices=[1, 2, 3],
                                        value=store.queue_slots(), scale=1,
                                        info="Each job uses Parameters → TTS concurrency.")
-                job_pick = gr.Textbox(label="Select job (id or #)", scale=2,
-                                      placeholder="e.g. 3f2a9c or 1")
-                select_btn = gr.Button("Show", scale=1)
+                job_pick = gr.Textbox(label="Selected job (id or #)", scale=2,
+                                      placeholder="Click a job row below, or type its id",
+                                      info="Continue and Cancel act on this job.")
+                select_btn = gr.Button("Show job", scale=1)
+                cancel_all_btn = gr.Button("Cancel all jobs", scale=1)
+                clear_btn = gr.Button("Clear finished jobs", scale=1)
             jobs_table = gr.Dataframe(
                 headers=["id", "book", "chapters", "state", "%", "elapsed", "output"],
                 datatype=["str", "str", "str", "str", "number", "str", "str"],
@@ -1071,7 +1184,9 @@ with gr.Blocks(title="Book to Audio") as demo:
                    outputs=[q_table, q_status])
 
     render_btn.click(on_enqueue, inputs=PARAM_INPUTS + [extra_args, chapter_pick],
-                     outputs=[run_status, jobs_table, progress, log_box])
+                     outputs=[run_status, jobs_table, progress, log_box, run_book])
+    continue_btn.click(on_continue_job, inputs=[job_pick],
+                       outputs=[run_status, jobs_table, progress, log_box, run_book])
     cancel_btn.click(on_cancel_job, inputs=[job_pick],
                      outputs=[run_status, jobs_table])
     cancel_all_btn.click(on_cancel_all, outputs=[run_status, jobs_table])
@@ -1089,7 +1204,7 @@ with gr.Blocks(title="Book to Audio") as demo:
 
     timer = gr.Timer(1.0, active=True)
     timer.tick(on_tick, outputs=[jobs_table, run_status, progress, log_box,
-                                 audio_out, download_out])
+                                 audio_out, download_out, run_book])
 
     # keep the "merge into" dropdown in sync with the cast table
     def _refresh_merge(rows):
