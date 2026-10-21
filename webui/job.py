@@ -123,6 +123,10 @@ class Job:
         start = self.started or self.created
         return (self.ended or time.time()) - start
 
+    def log_text(self, limit: int = 20000) -> str:
+        """Only the tail is shown; avoid joining thousands of lines per tick."""
+        return "\n".join(list(self.lines)[-600:])[-limit:]
+
     def snapshot(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -148,7 +152,6 @@ class Job:
             "elapsed": self.elapsed(),
             "queued_for": (self.started or time.time()) - self.created,
             "per_chapter": self.spec.per_chapter,
-            "log": "\n".join(self.lines),
         }
 
 

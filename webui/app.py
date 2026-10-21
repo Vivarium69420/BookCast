@@ -314,7 +314,7 @@ def _job_view(job, force_audio: bool = False):
     global LAST_AUDIO
     status = _job_status(job)
     pct = job.percent()
-    log = "\n".join(job.lines)[-20000:]
+    log = job.log_text()
     outs = [str(p) for p in store.job_outputs(job.spec)] if job.done else []
     audio = gr.skip()
     download = gr.skip()
