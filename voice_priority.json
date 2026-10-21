@@ -1,0 +1,119 @@
+{
+  "default_profile": "novel",
+  "skip": ["en-US-AnaNeural"],
+  "profiles": {
+    "novel": {
+      "_about": "Fiction/audiobooks: expressive, warm voices first; plainer announcer voices last.",
+      "female": [
+        "en-US-AvaMultilingualNeural",
+        "en-US-EmmaMultilingualNeural",
+        "en-US-AriaNeural",
+        "en-US-MichelleNeural",
+        "en-US-JennyNeural",
+        "en-GB-SoniaNeural",
+        "en-GB-LibbyNeural",
+        "en-AU-NatashaNeural",
+        "en-IE-EmilyNeural"
+      ],
+      "male": [
+        "en-US-AndrewMultilingualNeural",
+        "en-US-BrianMultilingualNeural",
+        "en-US-GuyNeural",
+        "en-GB-RyanNeural",
+        "en-US-ChristopherNeural",
+        "en-GB-ThomasNeural",
+        "en-US-RogerNeural",
+        "en-US-EricNeural",
+        "en-US-SteffanNeural",
+        "en-AU-WilliamNeural",
+        "en-IE-ConnorNeural"
+      ],
+      "neutral": [
+        "en-US-BrianMultilingualNeural",
+        "en-US-AvaMultilingualNeural",
+        "en-US-EmmaMultilingualNeural",
+        "en-US-AndrewMultilingualNeural",
+        "en-GB-RyanNeural",
+        "en-GB-SoniaNeural",
+        "en-US-GuyNeural",
+        "en-US-AriaNeural",
+        "en-US-JennyNeural",
+        "en-US-ChristopherNeural"
+      ]
+    },
+    "news": {
+      "_about": "Non-fiction, articles, reports: clear, steady delivery first.",
+      "female": [
+        "en-US-EmmaMultilingualNeural",
+        "en-US-AvaMultilingualNeural",
+        "en-US-AriaNeural",
+        "en-US-MichelleNeural",
+        "en-US-JennyNeural",
+        "en-GB-SoniaNeural",
+        "en-GB-LibbyNeural",
+        "en-AU-NatashaNeural",
+        "en-IE-EmilyNeural"
+      ],
+      "male": [
+        "en-US-AndrewMultilingualNeural",
+        "en-US-ChristopherNeural",
+        "en-US-GuyNeural",
+        "en-US-BrianMultilingualNeural",
+        "en-US-EricNeural",
+        "en-US-SteffanNeural",
+        "en-US-RogerNeural",
+        "en-GB-RyanNeural",
+        "en-GB-ThomasNeural",
+        "en-AU-WilliamNeural",
+        "en-IE-ConnorNeural"
+      ],
+      "neutral": [
+        "en-US-AndrewMultilingualNeural",
+        "en-US-EmmaMultilingualNeural",
+        "en-US-ChristopherNeural",
+        "en-US-AriaNeural",
+        "en-GB-RyanNeural",
+        "en-GB-SoniaNeural",
+        "en-US-GuyNeural",
+        "en-US-JennyNeural"
+      ]
+    },
+    "conversation": {
+      "_about": "Chatty, casual, dialogue-heavy text.",
+      "female": [
+        "en-US-AvaMultilingualNeural",
+        "en-US-EmmaMultilingualNeural",
+        "en-US-JennyNeural",
+        "en-US-AriaNeural",
+        "en-US-MichelleNeural",
+        "en-GB-SoniaNeural",
+        "en-GB-LibbyNeural",
+        "en-AU-NatashaNeural",
+        "en-IE-EmilyNeural"
+      ],
+      "male": [
+        "en-US-BrianMultilingualNeural",
+        "en-US-AndrewMultilingualNeural",
+        "en-US-GuyNeural",
+        "en-GB-RyanNeural",
+        "en-US-RogerNeural",
+        "en-US-ChristopherNeural",
+        "en-GB-ThomasNeural",
+        "en-US-EricNeural",
+        "en-US-SteffanNeural",
+        "en-AU-WilliamNeural",
+        "en-IE-ConnorNeural"
+      ],
+      "neutral": [
+        "en-US-AndrewMultilingualNeural",
+        "en-US-AvaMultilingualNeural",
+        "en-US-BrianMultilingualNeural",
+        "en-US-EmmaMultilingualNeural",
+        "en-GB-RyanNeural",
+        "en-US-JennyNeural",
+        "en-GB-SoniaNeural",
+        "en-US-GuyNeural"
+      ]
+    }
+  }
+}

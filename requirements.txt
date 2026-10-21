@@ -1,0 +1,20 @@
+# --- core: needed for EPUB/PDF ingestion, the default edge-tts engine, and
+#     the offline pyttsx3 fallback -------------------------------------------
+ebooklib>=0.18
+beautifulsoup4>=4.12
+pypdf>=4.0
+edge-tts>=6.1
+pyttsx3>=2.90
+numpy>=1.24
+
+# --- optional: the Kokoro offline neural engine (--engine kokoro) -----------
+# kokoro-onnx>=0.3
+# onnxruntime>=1.17
+
+# --- optional: the 'light' attribution engine (--light-model) ---------------
+# torch>=2.1
+# transformers>=4.40
+
+# The 'heavy' attribution engine (--heavy-model) talks to a local Ollama server
+# over HTTP (no Python package required); install Ollama separately and pull a
+# model, e.g. `ollama pull qwen3:14b`.

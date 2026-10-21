@@ -1,0 +1,33 @@
+# Downloaded evaluation corpora (large, not source)
+eval_data/
+
+# Evaluation output
+eval_results/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Books and generated audio (large / copyrighted)
+books/
+runs/
+models/
+*.epub
+*.pdf
+*.mp3
+*.wav
+*.m4a
+.*.book_to_audio_progress/
+book_to_audio.zip
+*_attribution.tsv
+
+# Local caches
+.ruff_cache/
+.pytest_cache/
+*.log
+
+# Secrets
+.env
+.env.*
