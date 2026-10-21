@@ -370,3 +370,36 @@ def save_preset(name: str, values: Dict[str, Any]) -> Path:
     p = PRESETS / f"{safe}.json"
     p.write_text(json.dumps(values, indent=2, ensure_ascii=False), encoding="utf-8")
     return p
+
+
+RUNTIME_SETTINGS = RUNS / "runtime.json"
+
+
+def runtime_settings(default_concurrency: int = 6,
+                     default_failure: str = "stop") -> Dict[str, Any]:
+    """Global runtime knobs: they do not change the audio/progress signature."""
+    data: Dict[str, Any] = {
+        "concurrency": max(1, min(16, int(default_concurrency))),
+        "on_chunk_failure": default_failure if default_failure in ("stop", "skip") else "stop",
+    }
+    if RUNTIME_SETTINGS.exists():
+        try:
+            loaded = json.loads(RUNTIME_SETTINGS.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data["concurrency"] = max(1, min(16, int(loaded.get("concurrency", data["concurrency"]))))
+                failure = loaded.get("on_chunk_failure", data["on_chunk_failure"])
+                if failure in ("stop", "skip"):
+                    data["on_chunk_failure"] = failure
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    return data
+
+
+def save_runtime_settings(concurrency: int, on_chunk_failure: str) -> Dict[str, Any]:
+    data = {
+        "concurrency": max(1, min(16, int(concurrency))),
+        "on_chunk_failure": on_chunk_failure if on_chunk_failure in ("stop", "skip") else "stop",
+    }
+    RUNS.mkdir(parents=True, exist_ok=True)
+    RUNTIME_SETTINGS.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return data

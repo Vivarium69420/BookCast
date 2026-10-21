@@ -55,40 +55,58 @@ In Colab:
 !python -m webui.app --share
 ```
 
-Workflow:
+Workflow (one page per open book, plus a shared Activity panel):
 
-1. **Book** – upload an EPUB/PDF (or paste a path), then **Analyze cast** (no audio).
-2. **Parameters** – every CLI flag, grouped; presets can be saved and reloaded.
-3. **Cast** – edit names/genders/voices/pitch, merge or delete characters, audition a line.
-   Changing a gender offers the first unused voice from that gender's pool; any voice can be overridden.
-   **Quotes** below lists each dialogue line (optionally only uncertain ones) and lets you reassign it.
-4. **Run** – pick chapters, **Render / continue current book**, watch the jobs table/log/progress,
-   download the MP3. The Run tab shows which book it will render; saved chunks are reused automatically.
+1. **Open a book** – upload an EPUB/PDF or paste a path. Every opened book is added to the
+   **Open books** rail; switching between books never stops their renders.
+2. **Book & chapters** – review the chapter table and type a printer-style range such as
+   `1-3, 6-8` (blank or `all` renders every chapter). **Analyze cast** runs without TTS.
+3. **Parameters** – every CLI flag except the global runtime knobs, grouped. Edit, then
+   **Apply changes**. Content changes show a review first and need **Confirm changes**; the next
+   render then warns and asks for confirmation because it will discard saved chunks. **Revert**
+   restores the applied settings. Presets and an exact-command preview live in the same panel.
+4. **Cast & quotes** – edit names/genders/voices/pitch, merge or delete characters, audition a
+   line. Changing a gender offers the first unused voice from that gender's pool; any voice can
+   be overridden. **Quotes** lists each dialogue line (optionally only uncertain ones) and lets
+   you reassign it.
+5. **Render this book** – **Render / continue current book** starts the active book now (or waits
+   for a slot) and resumes from saved chunks automatically. **Start over** ignores saved chunks
+   for that run only.
+6. **Activity** – shared by every open book: **Parallel renders**, global **TTS concurrency** and
+   **On chunk failure**, the jobs table, status/log/progress, audio/download, and
+   **Continue selected job** / **Cancel selected job** / **Cancel all jobs** / **Clear finished
+   jobs**.
+
+Open books are remembered in `runs/session.json`: refreshing the page or restarting the UI reopens
+the same books and the active one (up to five).
 
 ### Render queue
 
-The Run tab runs a bounded queue instead of a single job:
+The Activity panel runs a bounded queue instead of a single job:
 
-- **Parallel renders** (1–3, default 2) controls how many jobs run at once. Waiting jobs start
-  automatically; you can load and edit another book while renders run.
+- **Parallel renders** (1–3) controls how many books render at once. Waiting jobs start
+  automatically; you can open and edit other books while renders run.
 - Every job keeps its own log (`runs/<slug>/logs/<job-id>.log`), progress, and output.
 - Select a row (or type its id / queue number) to show that job's status, log, audio, and download.
-- **Render / continue current book** applies to the book named at the top of the Run tab. It starts
-  now or waits for a slot, and resumes from saved chunks automatically.
-- **Continue selected job** re-queues a cancelled or failed job with its original settings, resuming
-  from its saved chunks. **Cancel selected job** stops one job; **Cancel all jobs** stops the queue;
-  **Clear finished jobs** tidies the table.
+- **Continue selected job** re-queues a cancelled or failed job with its original content settings,
+  resuming from its saved chunks, while using the **current** global runtime settings.
 - A book can only have one queued/running job. The UI also writes a PID lock in
   `runs/<slug>/work/.ui-job.json`, so two UI instances (or a UI restarted while a CLI render is
   still running) cannot write to the same workspace.
 - Cast/quote edits are blocked while that book is rendering. Queued jobs read the cast when they
   start, so editing before then is fine.
 
-**Concurrency:** each job uses Parameters → **TTS concurrency** (default 6). Edge TTS is
-network-bound; 6–8 is stable on a typical home connection, 10–12 is often faster but can trigger
-HTTP 403 rate limits. Keep `parallel renders × TTS concurrency` around 12 or less; the queue also
-holds a job back if starting it would exceed 12 in-flight requests. If a job fails with 403s,
-lower both and re-run — completed chunks are kept.
+**Runtime settings vs content settings:** **TTS concurrency** and **On chunk failure** are global
+and safe to change without invalidating saved chunks; they are in Activity and apply to new and
+continued jobs (a running job keeps the settings it started with). Parameters such as **Rate**,
+**Max characters**, or **One MP3 per chapter** change the audio and therefore force the next
+render to start from scratch; the UI requires confirmation for those.
+
+**Concurrency:** the default is 6 TTS requests per job. Edge TTS is network-bound; 6–8 is stable on
+a typical home connection, 10–12 is often faster but can trigger HTTP 403 rate limits. Keep
+`parallel renders × TTS concurrency` around 12 or less; the queue also holds a job back if starting
+it would exceed 12 in-flight requests. If a job fails with 403s, lower both and re-run — completed
+chunks are kept.
 
 Each book gets a workspace under `runs/<book-slug>/`:
 

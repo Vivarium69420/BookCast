@@ -1,6 +1,10 @@
 """Gradio UI for book_to_audio.
 
-Run:  .venv/bin/python -m webui.app        (or ./run_ui.sh)
+One page, one open-book rail, one shared activity panel:
+- each open book keeps its own cast, applied settings, and chapter range;
+- renders continue when you switch books;
+- the Activity column is the only place for the queue, logs, audio, and
+  Continue/Cancel.
 """
 from __future__ import annotations
 
@@ -28,28 +32,224 @@ from webui import preview, store                            # noqa: E402
 from webui.job import JobQueue, JobSpec                     # noqa: E402
 
 MANAGER = JobQueue(slots=store.queue_slots())
+RUNTIME = store.runtime_settings()
 SELECTED_JOB: Optional[str] = None
 JOB_VIEW: List[str] = []
 LAST_AUDIO: Optional[tuple] = None
-S: Dict[str, Any] = {
-    "book": None,
-    "path": None,
-    "ws": None,
-    "cast": None,
-    "texts": {},
-    "dirty": set(),
-}
+
+SESSIONS: Dict[str, Dict[str, Any]] = {}
+OPEN_ORDER: List[str] = []
+ACTIVE_SLUG: Optional[str] = None
+
+PARAM_COMPONENTS: Dict[str, Any] = {}
+PARAM_ORDER: List[str] = []
+
+# These do not change the audio already produced, so they can change between a
+# stopped job and its continuation.
+RUNTIME_KEYS = {"concurrency", "on_chunk_failure", "keep_workdir"}
+ACTION_KEYS = {"fresh"}
+# Only these are hidden from the per-book form: concurrency and failure policy
+# live in Activity, and "fresh" is the Render section's Start over checkbox.
+HIDDEN_KEYS = {"concurrency", "on_chunk_failure", "fresh"}
+CONTENT_KEYS = [p.key for p in pspec.PARAMS
+                if p.key not in RUNTIME_KEYS and p.key not in ACTION_KEYS]
 
 CAST_SAVED_RE = re.compile(
     r"(?:Cast saved to|Cast analysis saved to|Using cached cast analysis:)\s*(.+?)(?:\s+—.*)?$")
 
-
-# --------------------------------------------------------------------------
-# helpers
-# --------------------------------------------------------------------------
-
 SUPPORTED_SUFFIXES = {".epub", ".pdf"}
+SESSION_FILE = ROOT / "runs" / "session.json"
 
+CSS = """
+.book-rail label { display: inline-block; margin-right: 18px; }
+.book-rail { min-height: 54px; }
+"""
+
+
+# --------------------------------------------------------------------------
+# session helpers
+# --------------------------------------------------------------------------
+
+def _blank_session() -> Dict[str, Any]:
+    return {
+        "slug": "",
+        "book": None,
+        "path": None,
+        "ws": None,
+        "cast": None,
+        "texts": {},
+        "dirty": set(),
+        "params": pspec.default_values(),
+        "extra": "",
+        "chapter_range": "all",
+        "needs_rerender": False,
+        "last_render_params": None,
+        "last_job": None,
+        "pending_params": None,
+        "pending_extra": "",
+    }
+
+
+S: Dict[str, Any] = _blank_session()
+
+
+def _activate(slug: Optional[str]) -> None:
+    global S, ACTIVE_SLUG
+    if slug and slug in SESSIONS:
+        S = SESSIONS[slug]
+        ACTIVE_SLUG = slug
+    else:
+        S = _blank_session()
+        ACTIVE_SLUG = None
+
+
+def _book_job(session: Optional[Dict[str, Any]] = None):
+    session = session or S
+    ws = session.get("ws")
+    if not ws:
+        return None
+    target = (ws / "work").resolve()
+    for job in reversed(MANAGER.jobs):
+        if Path(job.spec.workdir).resolve() == target:
+            return job
+    return None
+
+
+def _settings_differ(session: Optional[Dict[str, Any]] = None) -> bool:
+    session = session or S
+    last = session.get("last_render_params")
+    if not last:
+        return False
+    current = _content_fingerprint(_effective_values(session), session.get("extra", ""))
+    return current != last
+
+
+def _save_session_meta(**extra) -> None:
+    if not S.get("ws"):
+        return
+    store.save_meta(
+        S["ws"],
+        params=S.get("params") or pspec.default_values(),
+        extra=S.get("extra", ""),
+        chapter_range=S.get("chapter_range", "all"),
+        needs_rerender=bool(S.get("needs_rerender")),
+        last_render_params=S.get("last_render_params"),
+        **extra,
+    )
+
+
+def _load_session(path: Path, book=None) -> Dict[str, Any]:
+    book = book or _extract(path)
+    ws = store.workspace_for(path)
+    slug = ws.name
+    if slug in SESSIONS:
+        session = SESSIONS[slug]
+        session["book"] = book
+        session["path"] = path
+        session["ws"] = ws
+        session["texts"] = {i: ch.text for i, ch in enumerate(book.chapters, start=1)}
+        return session
+
+    meta = store.load_meta(ws)
+    params = pspec.default_values()
+    if isinstance(meta.get("params"), dict):
+        params.update(meta["params"])
+    elif meta.get("last_argv"):
+        params.update(pspec.parse_argv(meta["last_argv"]))
+    params["fresh"] = False
+    params["narrator_gender"] = params.get("narrator_gender") or ""
+    if params.get("voice_profile") is None:
+        params["voice_profile"] = ""
+
+    session = _blank_session()
+    session.update({
+        "slug": slug,
+        "book": book,
+        "path": path,
+        "ws": ws,
+        "cast": castlib.load(ws),
+        "texts": {i: ch.text for i, ch in enumerate(book.chapters, start=1)},
+        "params": params,
+        "extra": meta.get("extra", ""),
+        "chapter_range": meta.get("chapter_range") or meta.get("chapters") or "all",
+        "last_render_params": meta.get("last_render_params"),
+        "last_job": meta.get("last_job"),
+    })
+    session["needs_rerender"] = _settings_differ(session)
+    SESSIONS[slug] = session
+    if slug not in OPEN_ORDER:
+        OPEN_ORDER.append(slug)
+    return session
+
+
+# --------------------------------------------------------------------------
+# value helpers
+# --------------------------------------------------------------------------
+
+def _ui_value(key: str, value: Any) -> Any:
+    if key == "narrator_gender":
+        return "auto" if value in (None, "", "auto") else value
+    if key == "voice_profile" and value is None:
+        return ""
+    return value
+
+
+def _stored_value(key: str, value: Any) -> Any:
+    if key == "narrator_gender" and value in (None, "auto"):
+        return ""
+    if key == "voice_profile" and value is None:
+        return ""
+    return value
+
+
+def _values_from_widgets(seq) -> Dict[str, Any]:
+    """Values posted by the visible widgets, plus global runtime settings."""
+    vals = pspec.default_values()
+    for key, value in zip(PARAM_ORDER, seq):
+        vals[key] = _stored_value(key, value)
+    vals["concurrency"] = RUNTIME["concurrency"]
+    vals["on_chunk_failure"] = RUNTIME["on_chunk_failure"]
+    vals["fresh"] = False
+    return vals
+
+
+def _effective_values(session: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    session = session or S
+    vals = dict(session.get("params") or pspec.default_values())
+    vals["narrator_gender"] = vals.get("narrator_gender") or ""
+    if vals.get("voice_profile") is None:
+        vals["voice_profile"] = ""
+    vals["concurrency"] = RUNTIME["concurrency"]
+    vals["on_chunk_failure"] = RUNTIME["on_chunk_failure"]
+    vals["fresh"] = False
+    return vals
+
+
+def _content_fingerprint(values: Dict[str, Any], extra: str = "") -> Dict[str, Any]:
+    return {
+        "params": {key: values.get(key) for key in CONTENT_KEYS},
+        "extra": extra,
+    }
+
+
+def _format_value(value: Any) -> str:
+    if value is None or value == "":
+        return "(default)"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def _param_widget_values(session: Optional[Dict[str, Any]] = None) -> List[Any]:
+    session = session or S
+    params = session.get("params") or pspec.default_values()
+    return [_ui_value(key, params.get(key, pspec.BY_KEY[key].default))
+            for key in PARAM_ORDER]
+
+
+# --------------------------------------------------------------------------
+# extraction / chapter helpers
+# --------------------------------------------------------------------------
 
 def _extract(path: Path):
     args = argparse.Namespace(input_text=None, epub_encoding=None, min_chapter_words=150)
@@ -64,7 +264,6 @@ def _extract(path: Path):
 
 
 def _book_path_error(path: Path) -> str:
-    """Return a human-readable problem with ``path``, or '' when it is usable."""
     if not path.is_file():
         return f"Not a file: `{path}`"
     if path.suffix.lower() not in SUPPORTED_SUFFIXES:
@@ -73,11 +272,10 @@ def _book_path_error(path: Path) -> str:
     return ""
 
 
-
 def _chapter_rows(book) -> List[List[Any]]:
     rows = []
     for i, ch in enumerate(book.chapters, start=1):
-        quotes = sum(1 for k, _ in split_dialogue_narration(ch.text) if k == "dialogue")
+        quotes = sum(1 for kind, _ in split_dialogue_narration(ch.text) if kind == "dialogue")
         rows.append([i, ch.title[:90], len(ch.text.split()), quotes])
     return rows
 
@@ -93,9 +291,9 @@ def _label_index(label: str) -> Optional[int]:
         return None
 
 
-def _chapter_spec(labels: List[str], total: int) -> str:
-    idx = sorted({i for i in (_label_index(l) for l in labels or []) if i})
-    if not idx or len(idx) == total:
+def _compress_indices(indices: List[int]) -> str:
+    idx = sorted(set(indices))
+    if not idx:
         return ""
     parts, start, prev = [], idx[0], idx[0]
     for n in idx[1:]:
@@ -108,17 +306,100 @@ def _chapter_spec(labels: List[str], total: int) -> str:
     return ",".join(parts)
 
 
-def _values_from(seq) -> Dict[str, Any]:
-    """Values posted by the browser, in PARAM_ORDER."""
-    vals = {k: v for k, v in zip(PARAM_ORDER, seq)}
-    if vals.get("narrator_gender") in (None, "", "auto"):
-        vals["narrator_gender"] = ""
-    return vals
+def _parse_chapter_range(text: str, total: int) -> tuple:
+    """Return (cli_spec, indices, error).
+
+    ``all``/blank means every chapter.  Otherwise accept printer-style ranges:
+    ``1-3, 6-8`` (also en/em dashes and semicolons).
+    """
+    raw = (text or "").strip()
+    if total <= 0:
+        return "", [], "Load a book first."
+    if not raw or raw.lower() in ("all", "*"):
+        return "", list(range(1, total + 1)), ""
+
+    normalized = raw.replace("–", "-").replace("—", "-")
+    normalized = re.sub(r"\s*-\s*", "-", normalized)
+    tokens = [t for t in re.split(r"[,;\s]+", normalized) if t]
+    chosen: List[int] = []
+    for token in tokens:
+        if "-" in token:
+            a, _, b = token.partition("-")
+            if not a.isdigit() or not b.isdigit():
+                return "", [], f"`{token}` is not a valid range."
+            lo, hi = int(a), int(b)
+            if lo > hi:
+                return "", [], f"`{token}` is reversed; write {hi}-{lo}."
+            if lo < 1 or hi > total:
+                return "", [], f"`{token}` is outside 1-{total}."
+            chosen.extend(range(lo, hi + 1))
+        elif token.isdigit():
+            n = int(token)
+            if n < 1 or n > total:
+                return "", [], f"Chapter {n} is outside 1-{total}."
+            chosen.append(n)
+        else:
+            return "", [], f"`{token}` is not a chapter number or range."
+
+    idx = sorted(set(chosen))
+    if not idx:
+        return "", [], "No chapters selected."
+    spec = "" if len(idx) == total else _compress_indices(idx)
+    return spec, idx, ""
 
 
-def _base_argv(values: Dict[str, Any], extra: str = "") -> List[str]:
-    return pspec.build_argv(values, extra=extra)
+def _range_summary(session: Optional[Dict[str, Any]] = None) -> str:
+    session = session or S
+    book = session.get("book")
+    if not book:
+        return "Open a book first."
+    text = session.get("chapter_range") or "all"
+    spec, idx, error = _parse_chapter_range(text, len(book.chapters))
+    if error:
+        return f"⚠ {error}"
+    if len(idx) == len(book.chapters):
+        return f"All **{len(book.chapters)}** chapters."
+    return f"**{len(idx)} of {len(book.chapters)}** chapters: `{spec}`"
 
+
+def _book_info_md(session: Optional[Dict[str, Any]] = None) -> str:
+    session = session or S
+    book = session.get("book")
+    path = session.get("path")
+    if not book or not path:
+        return "No book open. Use **Open a book** below."
+    return (
+        f"### {book.title}\n"
+        f"`{Path(path).name}` · {len(book.chapters)} chapters · "
+        f"{sum(len(c.text.split()) for c in book.chapters):,} words  \n"
+        f"Workspace: `{session.get('ws')}`"
+    )
+
+
+def _quote_labels(book, cast) -> List[str]:
+    if not book or not cast:
+        return []
+    labels = []
+    for key in castlib.chapter_keys(cast):
+        try:
+            title = book.chapters[int(key) - 1].title
+        except (TypeError, ValueError, IndexError):
+            title = f"Chapter {key}"
+        labels.append(f"{key}. {title[:60]}")
+    return labels
+
+
+def _cast_note(session: Optional[Dict[str, Any]] = None) -> str:
+    session = session or S
+    cast = session.get("cast")
+    if cast:
+        return f"Loaded saved cast ({len(cast.get('characters', {}))} characters)."
+    return "No cast yet — press **Analyze cast**."
+
+
+# --------------------------------------------------------------------------
+# analysis / cast helpers
+# --------------------------------------------------------------------------
 
 def _run_sync(argv: List[str], timeout: int = 900) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -128,13 +409,12 @@ def _run_sync(argv: List[str], timeout: int = 900) -> subprocess.CompletedProces
 
 
 def _analyze_now(values: Dict[str, Any], extra: str = "") -> tuple:
-    """Run --analyze-only synchronously and copy the cast into the workspace."""
     if not S["path"] or not S["ws"]:
         return False, "Load a book first."
     busy = _busy_reason()
     if busy:
         return False, f"Cannot analyze: {busy}."
-    argv = [str(S["path"]), "--analyze-only"] + _base_argv(values, extra)
+    argv = [str(S["path"]), "--analyze-only"] + pspec.build_argv(values, extra=extra)
     try:
         proc = _run_sync(argv)
     except subprocess.TimeoutExpired:
@@ -144,13 +424,14 @@ def _analyze_now(values: Dict[str, Any], extra: str = "") -> tuple:
         return False, "Analysis failed:\n" + out[-2000:]
     cast_file = None
     for line in out.splitlines():
-        m = CAST_SAVED_RE.search(line)
-        if m:
-            cast_file = Path(m.group(1).strip())
+        match = CAST_SAVED_RE.search(line)
+        if match:
+            cast_file = Path(match.group(1).strip())
     if not cast_file or not cast_file.exists():
-        # fall back to the newest cast cache for this book
-        cached = sorted(Path(S["path"]).parent.glob(f".{Path(S['path']).stem}.cast*.json"),
-                        key=lambda p: p.stat().st_mtime, reverse=True)
+        cached = sorted(
+            Path(S["path"]).parent.glob(f".{Path(S['path']).stem}.cast*.json"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
         if cached:
             cast_file = cached[0]
     if not cast_file or not cast_file.exists():
@@ -158,7 +439,8 @@ def _analyze_now(values: Dict[str, Any], extra: str = "") -> tuple:
     data = json.loads(cast_file.read_text(encoding="utf-8"))
     target = store.cast_path(S["ws"])
     if target.exists():
-        target.with_suffix(".json.bak").write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+        target.with_suffix(".json.bak").write_text(
+            target.read_text(encoding="utf-8"), encoding="utf-8")
     target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     S["cast"] = data
     S["dirty"].clear()
@@ -171,15 +453,19 @@ def _reload_cast(data: Dict[str, Any]):
     speakers = castlib.character_names(data, include_buckets=True)
     keys = castlib.chapter_keys(data)
     labels = []
-    for k in keys:
+    for key in keys:
         try:
-            i = int(k)
-            title = S["book"].chapters[i - 1].title if S["book"] and i - 1 < len(S["book"].chapters) else f"Chapter {i}"
+            i = int(key)
+            title = (S["book"].chapters[i - 1].title
+                     if S["book"] and i - 1 < len(S["book"].chapters) else f"Chapter {i}")
         except (TypeError, ValueError, IndexError):
-            title = f"Chapter {k}"
-        labels.append(f"{k}. {title[:60]}")
-    return rows, gr.update(choices=speakers, value=speakers[0] if speakers else None), \
-        gr.update(choices=labels, value=labels[0] if labels else None)
+            title = f"Chapter {key}"
+        labels.append(f"{key}. {title[:60]}")
+    return (
+        rows,
+        gr.update(choices=speakers, value=speakers[0] if speakers else None),
+        gr.update(choices=labels, value=labels[0] if labels else None),
+    )
 
 
 def _chapters_for(cid: str) -> List[int]:
@@ -210,8 +496,19 @@ def _busy_reason() -> str:
     return ""
 
 
+def _invalidate(chapters) -> str:
+    if _busy_reason():
+        return ""
+    chapters = set(chapters) & S.get("dirty", set())
+    if not chapters:
+        return ""
+    done = store.invalidate_chapters(S["ws"], chapters)
+    S["dirty"] -= set(done)
+    return f" (re-render: {', '.join(map(str, done))})" if done else ""
+
+
 def _last_book_path() -> str:
-    """Path of the most recently rendered book, for the Book tab's path box."""
+    """Path of the most recently rendered book, for the open panel."""
     runs = ROOT / "runs"
     best = (0.0, "")
     if runs.is_dir():
@@ -230,48 +527,6 @@ def _last_book_path() -> str:
     return best[1]
 
 
-def _current_book_md() -> str:
-    """Show exactly which book the Run tab will render.
-
-    ``Add to queue`` was ambiguous because the book is loaded on another tab.
-    Keeping this card visible makes the primary action self-explanatory.
-    """
-    book = S.get("book")
-    path = S.get("path")
-    if not book or not path:
-        return ("### No book loaded\n"
-                "Open the **Book** tab and load a book first. "
-                "The buttons below render that loaded book.")
-    if S.get("cast"):
-        n = len((S["cast"].get("characters") or {}))
-        cast_state = f"{n} character(s) ready"
-    elif S.get("ws") and store.cast_path(S["ws"]).exists():
-        cast_state = "cast file ready"
-    else:
-        cast_state = "no cast yet (Analyze on the Book tab)"
-    ws = S.get("ws")
-    workspace = f"`{ws.name}`" if ws else "—"
-    return (
-        f"### {book.title}\n"
-        f"`{Path(path).name}` · {len(book.chapters)} chapters · "
-        f"workspace {workspace}  \n"
-        f"Cast: {cast_state}. **Render / continue** starts this book or resumes "
-        f"its saved chunks. To discard those chunks, enable **Ignore saved "
-        f"progress** in Parameters → Output."
-    )
-
-
-def _invalidate(chapters) -> str:
-    if _busy_reason():
-        return ""
-    chapters = set(chapters) & S.get("dirty", set())
-    if not chapters:
-        return ""
-    done = store.invalidate_chapters(S["ws"], chapters)
-    S["dirty"] -= set(done)
-    return f" (re-render: {', '.join(map(str, done))})" if done else ""
-
-
 # --------------------------------------------------------------------------
 # render queue helpers
 # --------------------------------------------------------------------------
@@ -281,11 +536,11 @@ def _jobs_rows() -> List[List[Any]]:
     jobs = MANAGER.jobs
     JOB_VIEW = [j.id for j in jobs]
     rows = []
-    for j in jobs:
-        snap = j.snapshot()
-        out = Path(j.spec.out_path).name + ("/" if j.spec.per_chapter else "")
+    for job in jobs:
+        snap = job.snapshot()
+        out = Path(job.spec.out_path).name + ("/" if job.spec.per_chapter else "")
         rows.append([
-            j.spec.short(), j.spec.title[:46], j.spec.chapters or "all",
+            job.spec.short(), job.spec.title[:46], job.spec.chapters or "all",
             snap["state"], round(snap["percent"]), f"{snap['elapsed']:.0f}s", out,
         ])
     return rows
@@ -330,7 +585,8 @@ def _queue_summary() -> str:
 def _job_status(job) -> str:
     snap = job.snapshot()
     state = snap["state"]
-    lines = [f"### {job.spec.title}", f"Job `{job.spec.short()}` · chapters {job.spec.chapters or 'all'}"]
+    lines = [f"### {job.spec.title}",
+             f"Job `{job.spec.short()}` · chapters {job.spec.chapters or 'all'}"]
     if state == "queued":
         pos = MANAGER.position(job.id)
         lines.append(f"**Queued** · position {pos} · waiting {snap['queued_for']:.0f}s")
@@ -359,7 +615,8 @@ def _job_status(job) -> str:
         lines.append(f"❌ `{snap['error']}`")
     outs = store.job_outputs(job.spec) if job.done else []
     if outs:
-        lines.append(f"Output: `{outs[0]}`" + (f" (+{len(outs) - 1} more)" if len(outs) > 1 else ""))
+        lines.append(f"Output: `{outs[0]}`" +
+                     (f" (+{len(outs) - 1} more)" if len(outs) > 1 else ""))
     lines.append(f"Queue: {_queue_summary()}")
     return "\n\n".join(lines)
 
@@ -385,166 +642,419 @@ def _job_view(job, force_audio: bool = False):
     return status, pct, log, audio, download
 
 
+def _book_run_md(session: Optional[Dict[str, Any]] = None) -> str:
+    session = session or S
+    book = session.get("book")
+    if not book:
+        return "No book open."
+    job = _book_job(session)
+    if job:
+        snap = job.snapshot()
+        state = snap["state"]
+        head = f"**{state.title()}** · job `{job.spec.short()}`"
+        if state == "queued":
+            head += f" · position {MANAGER.position(job.id)}"
+        if snap["chapter_total"]:
+            head += (f" · chapter {snap['chapter_index']}/{snap['chapter_total']}"
+                     f" · {snap['percent']:.0f}%")
+        if snap["chunk_total"]:
+            head += f" · chunks {snap['chunk_done']}/{snap['chunk_total']}"
+        if state in ("cancelled", "error"):
+            head += " — use **Continue selected job** in Activity."
+        if state == "done":
+            outs = store.job_outputs(job.spec)
+            if outs:
+                head += f" · `{outs[0]}`"
+        return head
+    if session.get("ws"):
+        pid = store.external_render_pid(session["ws"] / "work")
+        if pid:
+            return (f"⚠ An external render (PID {pid}) is writing this book's "
+                    f"workspace. Wait for it to finish before rendering here.")
+    if session.get("needs_rerender"):
+        return ("Ready, but applied settings differ from the last render. "
+                "The next render will start over after confirmation.")
+    return "Ready. Saved chunks are reused automatically."
+
+
+def _render_warning(session: Optional[Dict[str, Any]] = None) -> str:
+    session = session or S
+    if not session.get("needs_rerender"):
+        return ""
+    return ("⚠ **Applied content settings differ from the last render.** "
+            "Starting now will discard cached chunks and re-render from scratch. "
+            "Tick the confirmation box to continue, or revert the settings.")
+
+
+def _radio_choices() -> List[tuple]:
+    choices = []
+    for slug in OPEN_ORDER:
+        session = SESSIONS.get(slug)
+        if not session or not session.get("book"):
+            continue
+        title = session["book"].title
+        choices.append((f"{title}  ·  {slug}", slug))
+    return choices
+
+
+def _radio_update():
+    return gr.update(choices=_radio_choices(), value=ACTIVE_SLUG)
+
+
+def _persist_session() -> None:
+    """Remember open books and the active one across UI restarts."""
+    data = {
+        "open": [str(Path(SESSIONS[s]["path"]).resolve()) for s in OPEN_ORDER
+                 if SESSIONS.get(s, {}).get("path")],
+        "active": ACTIVE_SLUG,
+    }
+    try:
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SESSION_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _restore_session(limit: int = 5) -> None:
+    """Reopen the books that were open in the last UI session."""
+    if not SESSION_FILE.exists():
+        return
+    try:
+        data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    for raw in (data.get("open") or [])[:limit]:
+        path = Path(raw)
+        if not path.is_file():
+            continue
+        try:
+            _load_session(path)
+        except Exception:
+            continue
+    active = data.get("active")
+    if active in SESSIONS:
+        _activate(active)
+    elif OPEN_ORDER:
+        _activate(OPEN_ORDER[0])
+
+
+def _workspace_values(status: Optional[str] = None,
+                      session: Optional[Dict[str, Any]] = None) -> List[Any]:
+    """Values for WORKSPACE_OUTPUTS, in the same order as the components."""
+    session = session or S
+    book = session.get("book")
+    if not book:
+        return [
+            "No book open. Use **Open a book** below.",
+            [],
+            "all",
+            "Open a book first.",
+            status or "",
+            [],
+            "Analyze a book first.",
+            gr.update(choices=[], value=None),
+            gr.update(choices=[], value=None),
+            [],
+            "",
+            "",
+            "No book open.",
+            "",
+            gr.update(visible=False),
+            "No book open.",
+            "",
+            gr.update(value=False, visible=False),
+            False,
+            *_param_widget_values(session),
+        ]
+
+    cast = session.get("cast")
+    cast_rows = castlib.characters_rows(cast) if cast else []
+    speakers = castlib.character_names(cast, include_buckets=True) if cast else []
+    qlabels = _quote_labels(book, cast)
+    return [
+        _book_info_md(session),
+        _chapter_rows(book),
+        session.get("chapter_range") or "all",
+        _range_summary(session),
+        status or "Book ready.",
+        cast_rows,
+        _cast_note(session),
+        gr.update(choices=qlabels, value=qlabels[0] if qlabels else None),
+        gr.update(choices=speakers, value=speakers[0] if speakers else None),
+        [],
+        "",
+        session.get("extra", ""),
+        "Settings loaded." if not session.get("needs_rerender")
+        else "Applied settings differ from the last render.",
+        "",
+        gr.update(visible=False),
+        _book_run_md(session),
+        _render_warning(session),
+        gr.update(value=False,
+                  visible=bool(session.get("needs_rerender"))),
+        False,
+        *_param_widget_values(session),
+    ]
+
+
+def _idle_activity() -> List[Any]:
+    return ["", "Idle — queue empty.", 0.0, "",
+            gr.update(value=None), gr.update(value=None)]
+
+
+def _activity_values(session: Optional[Dict[str, Any]] = None) -> List[Any]:
+    global SELECTED_JOB
+    session = session or S
+    # Prefer this book's latest job, but keep the shared panel on the last
+    # selected job when this book has none.  That way closing a tab while its
+    # render continues does not hide the running job.
+    job = _book_job(session) or _selected_job()
+    if job is None:
+        return _idle_activity()
+    SELECTED_JOB = job.id
+    status, pct, log, audio, download = _job_view(job, force_audio=True)
+    return [job.id, status, pct, log, audio, download]
+
+
+def _book_view(status: Optional[str] = None,
+               session: Optional[Dict[str, Any]] = None) -> List[Any]:
+    _persist_session()
+    return [_radio_update()] + _workspace_values(status, session) + _activity_values(session)
+
+
 # --------------------------------------------------------------------------
-# book tab
+# book callbacks
 # --------------------------------------------------------------------------
 
-def on_upload(file):
+def on_open_upload(file):
     if not file:
-        return (gr.update(),) * 8
+        return _book_view("Choose an EPUB or PDF first.")
     src = Path(file)
     if src.suffix.lower() not in SUPPORTED_SUFFIXES:
         suffix = src.suffix or "(no extension)"
-        return (gr.update(),) * 7 + (
-            f"**Unsupported file type `{suffix}` — upload an .epub or .pdf.**",)
+        return _book_view(f"**Unsupported file type `{suffix}` — use .epub or .pdf.**")
     try:
         book = _extract(src)          # parse before copying, so bad files never land in books/
         path = store.ingest_upload(file, src.name)
-        return _open_book(path, book=book)
+        session = _load_session(path, book=book)
+        _activate(session["slug"])
+        return _book_view(f"Opened **{book.title}**.", session)
     except Exception as exc:
-        return (gr.update(),) * 7 + (f"**Upload failed:** `{exc}`",)
+        return _book_view(f"**Upload failed:** `{exc}`")
 
 
-def on_path_load(path_text: str):
+def on_open_path(path_text: str):
     raw = (path_text or "").strip()
     if not raw:
-        return (gr.update(),) * 7 + (
-            "**Enter a path to an .epub or .pdf file (or use Upload above).**",)
+        return _book_view("**Enter a path to an .epub or .pdf file.**")
     path = Path(raw).expanduser()
     if not path.exists():
-        return (gr.update(),) * 7 + (f"**Not found:** `{path}`",)
+        return _book_view(f"**Not found:** `{path}`")
     problem = _book_path_error(path)
     if problem:
-        return (gr.update(),) * 7 + (f"**{problem}**",)
+        return _book_view(f"**{problem}**")
     try:
-        return _open_book(path)
+        session = _load_session(path)
+        _activate(session["slug"])
+        return _book_view(f"Opened **{session['book'].title}**.", session)
     except Exception as exc:
-        return (gr.update(),) * 7 + (f"**Failed to open:** `{exc}`",)
+        return _book_view(f"**Failed to open:** `{exc}`")
 
 
-def _open_book(path: Path, book=None):
-    book = book or _extract(path)
-    S.update({
-        "book": book, "path": path, "ws": store.workspace_for(path),
-        "cast": None, "audio": None,
-        "texts": {i: ch.text for i, ch in enumerate(book.chapters, start=1)},
-        "dirty": set(),
-    })
-    labels = _chapter_labels(book)
-    chapter_rows = _chapter_rows(book)
-    info = (f"### {book.title}\n"
-            f"{len(book.chapters)} chapters · {sum(len(c.text.split()) for c in book.chapters):,} words  \n"
-            f"Source: `{path}`  \nWorkspace: `{S['ws']}`")
+def on_switch_book(slug: str):
+    if not slug:
+        return _book_view()
+    _activate(slug)
+    return _book_view()
 
-    data = castlib.load(S["ws"])
-    if data:
-        S["cast"] = data
-        cast_rows = castlib.characters_rows(data)
-        speakers = castlib.character_names(data, include_buckets=True)
-        qkeys = castlib.chapter_keys(data)
-        qlabels = []
-        for k in qkeys:
-            try:
-                title = book.chapters[int(k) - 1].title
-            except (TypeError, ValueError, IndexError):
-                title = f"Chapter {k}"
-            qlabels.append(f"{k}. {title[:60]}")
-        cast_note = f"Loaded saved cast ({len(data.get('characters', []))} characters)."
+
+def on_close_book():
+    global ACTIVE_SLUG
+    if not ACTIVE_SLUG:
+        return _book_view("No book is open.")
+    slug = ACTIVE_SLUG
+    session = SESSIONS.get(slug)
+    running = _book_job(session) if session else None
+    if slug in OPEN_ORDER:
+        OPEN_ORDER.remove(slug)
+    SESSIONS.pop(slug, None)
+    if OPEN_ORDER:
+        _activate(OPEN_ORDER[0])
     else:
-        cast_rows, speakers, qlabels = [], [], []
-        cast_note = "No cast yet — press **Analyze cast**."
-
-    return (
-        info,
-        chapter_rows,
-        gr.update(choices=labels, value=labels),
-        gr.update(choices=qlabels, value=qlabels[0] if qlabels else None),
-        cast_rows,
-        gr.update(choices=speakers, value=speakers[0] if speakers else None),
-        cast_note,
-        "Book loaded.",
-    )
+        _activate(None)
+    msg = "Closed the tab."
+    if running and running.running:
+        msg += " The render continues in Activity."
+        # Keep the running job selected so it stays visible.
+        global SELECTED_JOB
+        SELECTED_JOB = running.id
+    return _book_view(f"**{msg}**")
 
 
-def on_select_all():
-    if not S["book"]:
-        return gr.update()
-    labels = _chapter_labels(S["book"])
-    return gr.update(value=labels)
-
-
-def on_select_none():
-    return gr.update(value=[])
-
-
-def on_analyze(*args):
-    values = _values_from(args[:-1])
-    extra = args[-1] if args else ""
-    if not S["path"]:
-        return gr.update(), gr.update(), gr.update(), "Load a book first."
+def on_analyze():
+    if not S.get("book"):
+        return [], _cast_note(), gr.update(), gr.update(), "Load a book first.", "No book open."
     busy = _busy_reason()
     if busy:
-        return gr.update(), gr.update(), gr.update(), f"**Cannot analyze: {busy}.**"
-    ok, msg = _analyze_now(values, extra)
+        return (gr.update(), gr.update(), gr.update(), gr.update(),
+                f"**Cannot analyze: {busy}.**", _book_run_md())
+    values = _effective_values(S)
+    ok, msg = _analyze_now(values, S.get("extra", ""))
     if not ok or not S["cast"]:
-        return gr.update(), gr.update(), gr.update(), f"**{msg}**"
-    rows, spk, qs = _reload_cast(S["cast"])
-    return rows, spk, qs, f"**{msg}**"
+        return (gr.update(), gr.update(), gr.update(), gr.update(),
+                f"**{msg}**", _book_run_md())
+    rows, speakers, qs = _reload_cast(S["cast"])
+    return rows, _cast_note(), qs, speakers, f"**{msg}**", _book_run_md()
+
+
+def on_range_change(text: str):
+    if not S.get("book"):
+        return "Open a book first."
+    S["chapter_range"] = (text or "").strip() or "all"
+    _save_session_meta()
+    return _range_summary()
+
+
+def on_select_all_range():
+    if not S.get("book"):
+        return "all", "Open a book first."
+    S["chapter_range"] = "all"
+    _save_session_meta()
+    return "all", _range_summary()
 
 
 # --------------------------------------------------------------------------
 # parameters
 # --------------------------------------------------------------------------
 
-def on_preview_command(*args):
-    values = _values_from(args[:-2])
-    extra = args[-2] if len(args) >= 2 else ""
-    chapters = args[-1] if args else []
-    if S["path"]:
-        argv = [str(S["path"])] + _base_argv(values, extra)
-        if S["ws"]:
-            argv += ["--cast-file", str(store.cast_path(S["ws"])),
-                     "--workdir", str(S["ws"] / "work"),
-                     "-o", str(store.out_path(S["ws"], bool(values.get("per_chapter"))))]
-        spec = _chapter_spec(chapters, len(S["book"].chapters) if S["book"] else 0)
-        if spec:
-            argv += ["--chapters", spec]
+def on_apply_params(*args):
+    if not S.get("book"):
+        return "Open a book first.", "", gr.update(visible=False)
+    *widgets, extra = args
+    extra = extra or ""
+    draft = _values_from_widgets(widgets)
+    applied = _effective_values(S)
+
+    changed = []
+    for key in PARAM_ORDER:
+        old = applied.get(key)
+        new = draft.get(key)
+        if old != new:
+            changed.append((key, old, new))
+    extra_changed = extra != S.get("extra", "")
+
+    if not changed and not extra_changed:
+        return "No changes.", "", gr.update(visible=False)
+
+    busy = _busy_reason()
+    if busy:
+        return (f"**Cannot apply settings while {busy}.** Stop the job first; "
+                f"runtime settings in Activity can still change."), "", gr.update(visible=False)
+
+    content_changed = extra_changed or any(key not in RUNTIME_KEYS for key, _, _ in changed)
+    if not content_changed:
+        S["params"] = draft
+        S["extra"] = extra
+        _save_session_meta()
+        return ("Applied. These are runtime-only changes and will be used by the "
+                "next render."), "", gr.update(visible=False)
+
+    S["pending_params"] = draft
+    S["pending_extra"] = extra
+    lines = ["**Apply these changes?**"]
+    for key, old, new in changed:
+        label = pspec.BY_KEY[key].label
+        suffix = "next run only" if key in RUNTIME_KEYS else "content change — re-renders"
+        lines.append(f"- **{label}**: {_format_value(old)} → {_format_value(new)}  ·  {suffix}")
+    if extra_changed:
+        lines.append(f"- **Extra CLI args**: `{S.get('extra', '')}` → `{extra}`  ·  content change")
+    lines.append("\nContent changes do not touch the current render. The **next** "
+                 "render will start over after you confirm it.")
+    return ("Review the changes below and confirm.", "\n".join(lines),
+            gr.update(visible=True))
+
+
+def on_confirm_params():
+    if S.get("pending_params") is None:
+        return ("Nothing to confirm.", "", gr.update(visible=False),
+                _book_run_md(), _render_warning(), gr.update(visible=False, value=False))
+    S["params"] = S["pending_params"]
+    S["extra"] = S.get("pending_extra", "")
+    S["pending_params"] = None
+    S["pending_extra"] = ""
+    S["needs_rerender"] = _settings_differ()
+    _save_session_meta()
+    if S["needs_rerender"]:
+        status = ("Applied. The next render will start over because content settings "
+                  "differ from the last render.")
     else:
-        argv = ["<book.epub>"] + _base_argv(values, extra)
+        status = "Applied."
+    return (status, "", gr.update(visible=False), _book_run_md(), _render_warning(),
+            gr.update(value=False, visible=bool(S["needs_rerender"])))
+
+
+def on_revert_params():
+    S["pending_params"] = None
+    S["pending_extra"] = ""
+    S["needs_rerender"] = _settings_differ()
+    _save_session_meta()
+    return [
+        *_param_widget_values(S),
+        S.get("extra", ""),
+        "Reverted to the applied settings.",
+        "",
+        gr.update(visible=False),
+        _book_run_md(),
+        _render_warning(),
+        gr.update(value=False, visible=bool(S.get("needs_rerender"))),
+    ]
+
+
+def on_preview_command():
+    if not S.get("path") or not S.get("book"):
+        return "Open a book first."
+    values = _effective_values(S)
+    argv = [str(S["path"])] + pspec.build_argv(values, extra=S.get("extra", ""))
+    if S.get("ws"):
+        per_chapter = bool(values.get("per_chapter"))
+        argv += [
+            "--cast-file", str(store.cast_path(S["ws"])),
+            "--workdir", str(S["ws"] / "work"),
+            "-o", str(store.out_path(S["ws"], per_chapter)),
+        ]
+    spec, _, error = _parse_chapter_range(S.get("chapter_range", "all"),
+                                          len(S["book"].chapters))
+    if error:
+        return f"**Chapter selection error:** {error}"
+    if spec:
+        argv += ["--chapters", spec]
     return "python book_to_audio.py " + shlex.join(str(a) for a in argv)
 
 
-def _preset_value(name: str) -> Dict[str, Any]:
-    return store.load_preset(name) if name else {}
-
-
 def on_load_preset(name: str):
-    vals = _preset_value(name)
+    vals = store.load_preset(name) if name else {}
     out = []
     for key in PARAM_ORDER:
         p = pspec.BY_KEY[key]
-        v = vals.get(key, p.default)
-        if key == "narrator_gender":
-            v = "auto" if v in (None, "", "auto") else v
-        elif p.kind == "choice" and v not in p.choices:
-            v = p.default
-        out.append(v)
+        value = vals.get(key, p.default)
+        if p.kind == "choice" and key != "narrator_gender" and value not in p.choices:
+            value = p.default
+        out.append(_ui_value(key, value))
     return out
 
 
 def on_save_preset(name: str, *args):
     if not name.strip():
         return "**Preset name is empty.**", gr.update()
-    vals = _values_from(args)
-    if not vals.get("narrator_gender"):
-        vals["narrator_gender"] = "auto"
-    p = store.save_preset(name, vals)
+    vals = _values_from_widgets(args)
+    vals["narrator_gender"] = "auto" if not vals.get("narrator_gender") else vals["narrator_gender"]
+    path = store.save_preset(name, vals)
     names = store.preset_names()
-    return f"Saved `{p}`.", gr.update(choices=names, value=p.stem)
+    return f"Saved `{path}`.", gr.update(choices=names, value=path.stem)
 
 
 # --------------------------------------------------------------------------
-# cast tab
+# cast / quotes
 # --------------------------------------------------------------------------
 
 def on_cast_select(evt: gr.SelectData):
@@ -612,7 +1122,7 @@ def on_apply(cid: str, name: str, gender: str, voice: str, pitch: str):
     chapters = _chapters_for(cid)
     S["dirty"] |= set(chapters)
     note = _invalidate(chapters)
-    rows, spk, qs = _reload_cast(data)
+    rows, speakers, qs = _reload_cast(data)
     return rows, f"{msg}: `{cid}`{note}"
 
 
@@ -634,7 +1144,7 @@ def on_merge(src_label: str, dst_label: str):
     chapters = _chapters_for(dst)
     S["dirty"] |= set(chapters)
     note = _invalidate(chapters)
-    rows, spk, qs = _reload_cast(data)
+    rows, speakers, qs = _reload_cast(data)
     return rows, f"{msg}{note}"
 
 
@@ -651,7 +1161,7 @@ def on_delete(cid: str):
     castlib.save(S["ws"], S["cast"])
     S["dirty"] |= set(chapters)
     note = _invalidate(chapters)
-    rows, spk, qs = _reload_cast(S["cast"])
+    rows, speakers, qs = _reload_cast(S["cast"])
     return rows, f"{msg}{note}"
 
 
@@ -675,7 +1185,7 @@ def on_save_cast():
         return gr.update(), f"**Cannot edit: {busy}.**"
     castlib.save(S["ws"], S["cast"])
     note = _invalidate(S["dirty"])
-    rows, spk, qs = _reload_cast(S["cast"])
+    rows, speakers, qs = _reload_cast(S["cast"])
     return rows, "Cast saved." + note
 
 
@@ -691,22 +1201,18 @@ def on_revert():
     data = json.loads(bak.read_text(encoding="utf-8"))
     castlib.save(S["ws"], data)
     chapters = []
-    for k in castlib.chapter_keys(data):
+    for key in castlib.chapter_keys(data):
         try:
-            chapters.append(int(k))
+            chapters.append(int(key))
         except (TypeError, ValueError):
             pass
     note = ""
     if store.invalidate_chapters(S["ws"], chapters):
         note = f" (re-render: {', '.join(map(str, chapters))})"
-    rows, spk, qs = _reload_cast(data)
+    rows, speakers, qs = _reload_cast(data)
     S["dirty"].clear()
     return rows, "Reverted to the previous cast." + note
 
-
-# --------------------------------------------------------------------------
-# quotes tab
-# --------------------------------------------------------------------------
 
 def on_q_chapter(label: str, only: bool = True):
     if not S["cast"] or not label or not S["book"]:
@@ -765,49 +1271,95 @@ def on_assign(seg, speaker_label: str, chapter_label: str = "", only: bool = Tru
     chapter = int(key)
     S["dirty"].add(chapter)
     note = _invalidate({chapter})
-    rows, spk, qs = _reload_cast(S["cast"])
+    rows, speakers, qs = _reload_cast(S["cast"])
     return on_q_chapter(chapter_label, only), f"{msg}{note}"
 
 
 # --------------------------------------------------------------------------
-# run tab
+# render callbacks
 # --------------------------------------------------------------------------
 
-def on_enqueue(*args):
+def _set_flag(args: List[str], flag: str, value: Any) -> List[str]:
+    out, i = [], 0
+    while i < len(args):
+        token = args[i]
+        if token == flag:
+            i += 2 if i + 1 < len(args) and not args[i + 1].startswith("-") else 1
+            continue
+        if token.startswith(flag + "="):
+            i += 1
+            continue
+        out.append(token)
+        i += 1
+    if value is not None:
+        out += [flag, str(value)]
+    return out
+
+
+def on_render(chapter_range: str, start_over: bool, confirm_restart: bool):
     global SELECTED_JOB
-    values = _values_from(args[:-2])
-    extra = args[-2] if len(args) >= 2 else ""
-    chapters = args[-1] if args else []
     rows = _jobs_rows()
-    book_md = _current_book_md()
-    if not S["path"] or not S["ws"]:
-        return "Load a book first.", rows, 0.0, "", book_md
+    book_md = _book_run_md()
+    if not S.get("path") or not S.get("ws") or not S.get("book"):
+        return ("Load a book first.", rows, 0.0, "", book_md,
+                "Open a book first.", "No book open.", "", gr.update(visible=False),
+                gr.update(value=False))
+
+    text = (chapter_range or "").strip() or "all"
+    S["chapter_range"] = text
+    _save_session_meta()
+    spec, _indices, error = _parse_chapter_range(text, len(S["book"].chapters))
+    if error:
+        return (f"**Chapter selection error:** {error}", rows, 0.0, "", book_md,
+                _range_summary(), "Fix the chapter range.", "", gr.update(visible=False),
+                gr.update(value=False))
+
+    needs_restart = bool(S.get("needs_rerender")) and not start_over
+    if needs_restart and not confirm_restart:
+        return ("**Settings changed.** Review the warning below and tick the "
+                "confirmation box, or enable **Start over**.", rows, 0.0, "",
+                book_md, _range_summary(), "Settings need confirmation.",
+                _render_warning(), gr.update(value=False, visible=True),
+                gr.update(value=False))
 
     workdir = S["ws"] / "work"
     busy = MANAGER.has_workspace(workdir)
     if busy:
         return (f"**Already {busy.state}** as job `{busy.spec.short()}`. "
-                f"Cancel it first, or wait for it to finish."), rows, 0.0, "", book_md
+                f"Cancel it first, or wait for it to finish.", rows, 0.0, "",
+                book_md, _range_summary(), "Wait for the current job.",
+                _render_warning(), gr.update(visible=needs_restart),
+                gr.update(value=False))
     pid = store.external_render_pid(workdir)
     if pid:
-        return (f"**PID {pid} is already rendering this book.** "
-                f"Wait for it to finish (or stop that process) before queuing another."), rows, 0.0, "", book_md
+        return (f"**PID {pid} is already rendering this book.** Wait for it to "
+                f"finish (or stop that process) before queuing another.", rows, 0.0, "",
+                book_md, _range_summary(), "Wait for the external render.",
+                _render_warning(), gr.update(visible=needs_restart),
+                gr.update(value=False))
+
+    values = _effective_values(S)
+    if start_over or needs_restart:
+        values["fresh"] = True
 
     if not store.cast_path(S["ws"]).exists():
-        ok, msg = _analyze_now(values, extra)
+        ok, msg = _analyze_now(values, S.get("extra", ""))
         if not ok:
-            return f"**{msg}**", rows, 0.0, msg, book_md
+            return (f"**{msg}**", rows, 0.0, msg, book_md,
+                    _range_summary(), "Analysis failed.", _render_warning(),
+                    gr.update(visible=needs_restart), gr.update(value=False))
     if not store.cast_path(S["ws"]).exists():
-        return "No cast file — run Analyze first.", rows, 0.0, "", book_md
+        return ("No cast file — run Analyze first.", rows, 0.0, "", book_md,
+                _range_summary(), "No cast.", "", gr.update(visible=False),
+                gr.update(value=False))
 
     per_chapter = bool(values.get("per_chapter"))
     out = store.out_path(S["ws"], per_chapter)
     if per_chapter:
         out.mkdir(parents=True, exist_ok=True)
-    argv = [str(S["path"])] + _base_argv(values, extra)
+    argv = [str(S["path"])] + pspec.build_argv(values, extra=S.get("extra", ""))
     argv += ["--cast-file", str(store.cast_path(S["ws"])),
              "--workdir", str(workdir), "-o", str(out)]
-    spec = _chapter_spec(chapters, len(S["book"].chapters) if S["book"] else 0)
     if spec:
         argv += ["--chapters", spec]
 
@@ -816,36 +1368,42 @@ def on_enqueue(*args):
         cast_file=store.cast_path(S["ws"]), workdir=workdir,
         out_path=out, args=argv, chapters=spec, per_chapter=per_chapter,
     )
-    store.save_meta(S["ws"], last_argv=argv, chapters=spec,
-                    per_chapter=per_chapter, last_job=job_spec.id)
+    fingerprint = _content_fingerprint(values, S.get("extra", ""))
+    store.save_meta(
+        S["ws"], last_argv=argv, chapters=spec, chapter_range=text,
+        per_chapter=per_chapter, last_job=job_spec.id,
+        params=S["params"], extra=S.get("extra", ""),
+        last_render_params=fingerprint, needs_rerender=False,
+    )
     try:
         job = MANAGER.enqueue(job_spec, cwd=ROOT,
                               log_path=store.job_log_path(S["ws"], job_spec.id))
     except Exception as exc:
-        return f"**Could not queue:** `{exc}`", rows, 0.0, "", book_md
+        return (f"**Could not queue:** `{exc}`", rows, 0.0, "", book_md,
+                _range_summary(), "Queue failed.", _render_warning(),
+                gr.update(visible=needs_restart), gr.update(value=False))
+    S["needs_rerender"] = False
+    S["last_render_params"] = fingerprint
+    S["last_job"] = job.id
     SELECTED_JOB = job.id
     rows = _jobs_rows()
     if job.state == "queued":
-        pos = MANAGER.position(job.id)
-        head = f"**Queued** `{job.spec.short()}` (position {pos})."
+        head = f"**Queued** `{job.spec.short()}` (position {MANAGER.position(job.id)})."
     elif job.state in ("running", "stalled"):
         head = f"**Started** `{job.spec.short()}`."
     else:
         head = f"**Job `{job.spec.short()}` failed:** `{job.error}`"
-    return (f"{head} Chapters: {spec or 'all'} · output `{out}`\n"
-            f"```\npython book_to_audio.py {shlex.join(argv)}\n```"), rows, 0.0, "", book_md
+    return (
+        f"{head} Chapters: {spec or 'all'} · output `{out}`",
+        rows, 0.0, "", _book_run_md(), _range_summary(), "Rendering.",
+        "", gr.update(value=False, visible=False), gr.update(value=False),
+    )
 
 
 def on_continue_job(selector: str):
-    """Re-queue a cancelled/failed job using its original captured settings.
-
-    Renders are resumable, so the right recovery action after Cancel is to
-    continue the same job rather than make the user reconstruct it from the
-    Book and Parameters tabs.
-    """
     global SELECTED_JOB
     rows = _jobs_rows()
-    book_md = _current_book_md()
+    book_md = _book_run_md()
     job = _resolve_job(selector)
     if job is None:
         return ("Select a **cancelled** or **failed** job in the table first.",
@@ -857,7 +1415,7 @@ def on_continue_job(selector: str):
     spec = job.spec
     if not spec.workdir.exists():
         return (f"No saved work folder for `{spec.short()}`. Use "
-                f"**Render / continue** to start this book from scratch."), \
+                f"**Render / continue current book** to start from scratch."), \
             rows, 0.0, "", book_md
     if not spec.cast_file.exists():
         return (f"Cast file for `{spec.short()}` is missing: `{spec.cast_file}`."), \
@@ -875,9 +1433,11 @@ def on_continue_job(selector: str):
         return (f"PID {pid} is already rendering this book. Wait for it to "
                 f"finish before continuing."), rows, 0.0, "", book_md
 
-    # A continue must resume, never replay a captured --fresh flag.
-    args = [a for a in spec.args
-            if a != "--fresh" and not a.startswith("--fresh=")]
+    # Continue keeps the job's original content settings and chapters, but
+    # applies the current global runtime values.
+    args = [a for a in spec.args if a != "--fresh" and not a.startswith("--fresh=")]
+    args = _set_flag(args, "--concurrency", RUNTIME["concurrency"])
+    args = _set_flag(args, "--on-chunk-failure", RUNTIME["on_chunk_failure"])
     new_spec = JobSpec(
         book=spec.book, title=spec.title, cast_file=spec.cast_file,
         workdir=spec.workdir, out_path=spec.out_path, args=args,
@@ -886,52 +1446,70 @@ def on_continue_job(selector: str):
     if spec.per_chapter:
         Path(spec.out_path).mkdir(parents=True, exist_ok=True)
     ws = spec.workdir.parent
-    store.save_meta(ws, last_argv=args, chapters=spec.chapters,
-                    per_chapter=spec.per_chapter, last_job=new_spec.id)
+    store.save_meta(ws, last_job=new_spec.id)
     try:
         new_job = MANAGER.enqueue(new_spec, cwd=ROOT,
                                   log_path=store.job_log_path(ws, new_spec.id))
     except Exception as exc:
         return f"**Could not continue:** `{exc}`", rows, 0.0, "", book_md
     SELECTED_JOB = new_job.id
+    if S.get("ws") and Path(S["ws"]).resolve() == Path(ws).resolve():
+        S["last_job"] = new_job.id
     rows = _jobs_rows()
     state = "Queued" if new_job.state == "queued" else "Started"
     return (f"**{state}** `{new_spec.short()}` — continuing `{spec.short()}` "
             f"from saved chunks · output `{spec.out_path}`"), \
-        rows, 0.0, "", book_md
+        rows, 0.0, "", _book_run_md()
 
 
 def on_cancel_job(selector: str):
     global SELECTED_JOB
     job = _resolve_job(selector)
     if job is None:
-        return "No job selected.", _jobs_rows()
+        return "No job selected.", _jobs_rows(), _book_run_md()
     SELECTED_JOB = job.id
     was_running = job.running
     ok = MANAGER.cancel(job.id)
     if not ok:
-        return f"Job `{job.spec.short()}` is not queued or running.", _jobs_rows()
+        return (f"Job `{job.spec.short()}` is not queued or running.",
+                _jobs_rows(), _book_run_md())
     if was_running:
         return (f"Cancelling `{job.spec.short()}`… Saved chunks are kept — "
-                f"click **Continue selected job** to resume."), _jobs_rows()
-    return f"Removed `{job.spec.short()}` from the queue.", _jobs_rows()
+                f"click **Continue selected job** to resume."), \
+            _jobs_rows(), _book_run_md()
+    return f"Removed `{job.spec.short()}` from the queue.", _jobs_rows(), _book_run_md()
 
 
 def on_cancel_all():
     n = MANAGER.cancel_all()
-    return (f"Cancelling {n} job(s)." if n else "No queued or running jobs."), _jobs_rows()
+    return ((f"Cancelling {n} job(s)." if n else "No queued or running jobs."),
+            _jobs_rows(), _book_run_md())
 
 
 def on_clear_finished():
     n = MANAGER.clear_finished()
-    return (f"Cleared {n} finished job(s)." if n else "No finished jobs to clear."), _jobs_rows()
+    return ((f"Cleared {n} finished job(s)." if n else "No finished jobs to clear."),
+            _jobs_rows(), _book_run_md())
 
 
 def on_slots(slots):
     n = MANAGER.set_slots(int(slots or 1))
     store.save_queue_slots(n)
     return (f"Parallel renders: **{n}**. Keep parallel × TTS concurrency ≤ ~12 "
-            f"to avoid Edge rate limiting."), _jobs_rows()
+            f"to avoid Edge rate limiting."), _jobs_rows(), _book_run_md()
+
+
+def on_runtime_change(concurrency, on_chunk_failure):
+    global RUNTIME
+    try:
+        conc = max(1, min(16, int(concurrency or 6)))
+    except (TypeError, ValueError):
+        conc = 6
+    failure = on_chunk_failure if on_chunk_failure in ("stop", "skip") else "stop"
+    RUNTIME = store.save_runtime_settings(conc, failure)
+    return (f"Runtime saved: **{conc}** TTS requests, failure policy **{failure}**. "
+            f"This applies to new jobs and **Continue**; running jobs keep their "
+            f"captured settings.")
 
 
 def on_job_select(evt: gr.SelectData):
@@ -961,7 +1539,8 @@ def on_job_pick(selector: str):
     global SELECTED_JOB
     job = _resolve_job(selector)
     if job is None:
-        return gr.skip(), "No job matches that id or number.", gr.skip(), gr.skip(), gr.skip(), gr.skip()
+        return (gr.skip(), "No job matches that id or number.",
+                gr.skip(), gr.skip(), gr.skip(), gr.skip())
     SELECTED_JOB = job.id
     status, pct, log, audio, download = _job_view(job, force_audio=True)
     return job.id, status, pct, log, audio, download
@@ -971,7 +1550,7 @@ def on_tick():
     global SELECTED_JOB
     MANAGER.pump()
     rows = _jobs_rows()
-    book_md = _current_book_md()
+    book_md = _book_run_md()
     job = _selected_job()
     if job is None:
         msg = "Idle — queue empty."
@@ -991,8 +1570,8 @@ def on_tick():
 # layout
 # --------------------------------------------------------------------------
 
-PARAM_COMPONENTS: Dict[str, Any] = {}
-PARAM_ORDER: List[str] = []
+# Reopen the books from the previous UI session before building the page.
+_restore_session()
 
 
 def build_param_widget(p: pspec.Param):
@@ -1021,140 +1600,200 @@ def build_param_widget(p: pspec.Param):
     if p.key == "voice_profile":
         return gr.Dropdown(label=p.label, choices=sorted(store.voice_profiles()),
                            value=None, allow_custom_value=True, info=p.help)
-    return gr.Textbox(label=p.label, value="" if p.default is None else str(p.default), info=p.help)
+    return gr.Textbox(label=p.label, value="" if p.default is None else str(p.default),
+                      info=p.help)
 
 
-with gr.Blocks(title="Book to Audio") as demo:
-    gr.Markdown("# Book to Audio\nEPUB/PDF → multi-voice audiobook. "
-                "The UI drives the existing CLI; nothing is re-implemented here.")
+with gr.Blocks(title="Book to Audio", css=CSS) as demo:
+    gr.Markdown("# Book to Audio\nOne page per open book; one shared Activity panel. "
+                "Renders continue when you switch books.")
 
-    with gr.Tabs():
-        # ------------------------------------------------------------- Book
-        with gr.Tab("Book"):
+    with gr.Row():
+        # ------------------------------------------------------------ workspace
+        with gr.Column(scale=3, min_width=720):
             with gr.Row():
-                with gr.Column(scale=1):
-                    upload = gr.File(label="Upload EPUB / PDF", type="filepath",
-                                     file_types=[".epub", ".pdf"])
-                    path_box = gr.Textbox(label="…or a path on disk",
-                                          value=_last_book_path(),
-                                          placeholder="/home/you/books/Book.epub",
-                                          info="The last rendered book is pre-filled; click Load path to reopen it.")
-                    load_path = gr.Button("Load path")
-                    analyze_btn = gr.Button("Analyze cast (no TTS)", variant="secondary")
-                with gr.Column(scale=2):
-                    book_info = gr.Markdown("No book loaded.")
-                    chapter_table = gr.Dataframe(
-                        headers=["#", "Chapter", "Words", "Dialogue lines"],
-                        datatype=["number", "str", "number", "number"],
-                        interactive=False, wrap=True, max_height=260)
-                    with gr.Row():
-                        pick_all = gr.Button("Select all")
-                        pick_none = gr.Button("Select none")
-                    chapter_pick = gr.Dropdown(
-                        label="Chapters to render", choices=[], value=[], multiselect=True,
-                        allow_custom_value=True,
-                        info="Empty = all chapters. Update after loading a book.")
-                    book_status = gr.Markdown("")
+                # A Dropdown with allow_custom_value keeps a newly opened book
+                # selectable even though Gradio validates Radio inputs against
+                # the choices the server component was built with.
+                book_radio = gr.Dropdown(label="Open books",
+                                         choices=_radio_choices(),
+                                         value=ACTIVE_SLUG,
+                                         interactive=True, elem_classes=["book-rail"],
+                                         allow_custom_value=True, scale=4)
+                close_book_btn = gr.Button("Close book", scale=1)
 
-        # ------------------------------------------------------- Parameters
-        with gr.Tab("Parameters"):
-            for group in pspec.GROUPS:
-                with gr.Accordion(group, open=(group in ("Voice", "Attribution"))):
-                    for p in [x for x in pspec.PARAMS if x.group == group]:
-                        PARAM_COMPONENTS[p.key] = build_param_widget(p)
-                        PARAM_ORDER.append(p.key)
+            with gr.Accordion("Open a book", open=False):
+                open_upload = gr.File(label="Upload EPUB / PDF", type="filepath",
+                                      file_types=[".epub", ".pdf"])
+                open_path = gr.Textbox(
+                    label="…or a path on disk",
+                    value=_last_book_path(),
+                    placeholder="/home/you/books/Book.epub",
+                    info="The last rendered book is pre-filled.",
+                )
+                open_path_btn = gr.Button("Open path", variant="primary")
 
+            book_info = gr.Markdown("No book open. Use **Open a book** below.")
 
-            with gr.Accordion("Presets", open=False):
+            with gr.Accordion("Book & chapters", open=True):
+                chapter_table = gr.Dataframe(
+                    headers=["#", "Chapter", "Words", "Dialogue lines"],
+                    datatype=["number", "str", "number", "number"],
+                    interactive=False, wrap=True, max_height=260)
                 with gr.Row():
-                    preset_dd = gr.Dropdown(label="Preset", choices=store.preset_names(), value=None,
-                                            allow_custom_value=True)
-                    load_preset_btn = gr.Button("Load")
-                    preset_name = gr.Textbox(label="Save as", placeholder="verity-chapter-preview")
-                    save_preset_btn = gr.Button("Save preset")
-                preset_status = gr.Markdown("")
-
-            with gr.Accordion("Advanced", open=False):
-                extra_args = gr.Textbox(label="Extra CLI args (appended verbatim)",
-                                        placeholder="--unknown-below 0.35")
-                preview_btn = gr.Button("Show exact command")
-                cmd_preview = gr.Code(label="Command", interactive=False)
-
-        # ------------------------------------------------------------- Cast
-        with gr.Tab("Cast"):
-            cast_note = gr.Markdown("Analyze a book first.")
-            with gr.Row():
-                with gr.Column(scale=3):
-                    cast_table = gr.Dataframe(
-                        headers=["id", "name", "lines", "gender", "voice", "pitch"],
-                        datatype=["str", "str", "number", "str", "str", "str"],
-                        interactive=False, wrap=True, max_height=300)
-                    row_number = gr.Number(label="Row # (1-based)", precision=0, value=1)
-                with gr.Column(scale=2):
-                    cid_box = gr.Textbox(label="Character id", interactive=False)
-                    name_box = gr.Textbox(label="Name")
-                    gender_dd = gr.Dropdown(label="Gender", choices=["", "male", "female", "neutral"],
-                                            allow_custom_value=True)
-                    voice_dd = gr.Dropdown(label="Voice", choices=store.all_voices(),
-                                           allow_custom_value=True)
-                    pitch_box = gr.Textbox(label="Pitch", value="+0Hz")
-                    with gr.Row():
-                        apply_btn = gr.Button("Apply", variant="primary")
-                        audition_btn = gr.Button("Audition")
-                    with gr.Row():
-                        merge_dst = gr.Dropdown(label="Merge into", choices=[], allow_custom_value=True)
-                        merge_btn = gr.Button("Merge")
-                        delete_btn = gr.Button("Delete")
-                    audition_audio = gr.Audio(label="Preview", type="filepath", interactive=False)
-                    cast_status = gr.Markdown("")
-                    with gr.Row():
-                        save_cast_btn = gr.Button("Save cast")
-                        revert_btn = gr.Button("Revert to backup")
-
-            with gr.Accordion("Quotes", open=True):
+                    chapter_range = gr.Textbox(
+                        label="Chapters to render", value="all", scale=3,
+                        placeholder="all, or 1-3, 6-8",
+                        info="Printer-style ranges. Blank or 'all' = every chapter.",
+                    )
+                    range_all_btn = gr.Button("All chapters", scale=1)
+                chapter_summary = gr.Markdown("Open a book first.")
                 with gr.Row():
-                    q_chapter = gr.Dropdown(label="Chapter", choices=[], allow_custom_value=True)
-                    q_only = gr.Checkbox(label="Only uncertain (low confidence / Unknown)",
-                                         value=True)
-                q_table = gr.Dataframe(
-                    headers=["seg", "speaker", "id", "method", "confidence", "text"],
-                    datatype=["number", "str", "str", "str", "str", "str"],
-                    interactive=False, wrap=True, max_height=340)
-                with gr.Row():
-                    q_seg = gr.Number(label="Segment #", precision=0, value=0)
-                    q_speaker = gr.Dropdown(label="Assign to", choices=[], allow_custom_value=True)
-                    q_assign = gr.Button("Assign", variant="primary")
-                q_status = gr.Markdown("")
+                    analyze_btn = gr.Button("Analyze cast (no TTS)", variant="secondary",
+                                            scale=2)
+                book_status = gr.Markdown("")
 
-        # -------------------------------------------------------------- Run
-        with gr.Tab("Run"):
-            run_book = gr.Markdown(_current_book_md())
-            with gr.Row():
-                render_btn = gr.Button("Render / continue current book",
-                                       variant="primary", scale=3)
-                continue_btn = gr.Button("Continue selected job", scale=1)
-                cancel_btn = gr.Button("Cancel selected job", variant="stop", scale=1)
-            gr.Markdown("_**Render / continue** acts on the book shown above. It starts "
-                        "now, or waits if all parallel slots are busy. Saved chunks are "
-                        "reused automatically. **Continue selected job** re-queues a "
-                        "cancelled or failed job from the table below._")
-            with gr.Row():
+            with gr.Accordion("Parameters", open=False):
+                gr.Markdown("_Runtime settings — TTS concurrency, failure policy, and "
+                            "parallel slots — are in the Activity panel. Apply changes "
+                            "here before rendering._")
+                for group in pspec.GROUPS:
+                    visible = [p for p in pspec.PARAMS
+                               if p.group == group and p.key not in HIDDEN_KEYS]
+                    if not visible:
+                        continue
+                    with gr.Accordion(group, open=(group in ("Voice", "Attribution"))):
+                        for p in visible:
+                            PARAM_COMPONENTS[p.key] = build_param_widget(p)
+                            PARAM_ORDER.append(p.key)
+
+                extra_args = gr.Textbox(
+                    label="Extra CLI args (appended verbatim)",
+                    placeholder="--unknown-below 0.35",
+                )
+                with gr.Row():
+                    apply_params_btn = gr.Button("Apply changes", variant="primary")
+                    revert_params_btn = gr.Button("Revert")
+                params_status = gr.Markdown("No book open.")
+                params_review = gr.Markdown("")
+                confirm_params_btn = gr.Button("Confirm changes", variant="primary",
+                                               visible=False)
+
+                with gr.Accordion("Presets", open=False):
+                    with gr.Row():
+                        preset_dd = gr.Dropdown(label="Preset", choices=store.preset_names(),
+                                                value=None, allow_custom_value=True)
+                        load_preset_btn = gr.Button("Load")
+                        preset_name = gr.Textbox(label="Save as",
+                                                 placeholder="verity-chapter-preview")
+                        save_preset_btn = gr.Button("Save preset")
+                    preset_status = gr.Markdown("")
+
+                with gr.Accordion("Command preview", open=False):
+                    preview_btn = gr.Button("Show exact command")
+                    cmd_preview = gr.Code(label="Command", interactive=False)
+
+            with gr.Accordion("Cast & quotes", open=False):
+                cast_note = gr.Markdown("Analyze a book first.")
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        cast_table = gr.Dataframe(
+                            headers=["id", "name", "lines", "gender", "voice", "pitch"],
+                            datatype=["str", "str", "number", "str", "str", "str"],
+                            interactive=False, wrap=True, max_height=300)
+                        row_number = gr.Number(label="Row # (1-based)", precision=0, value=1)
+                    with gr.Column(scale=2):
+                        cid_box = gr.Textbox(label="Character id", interactive=False)
+                        name_box = gr.Textbox(label="Name")
+                        gender_dd = gr.Dropdown(
+                            label="Gender", choices=["", "male", "female", "neutral"],
+                            allow_custom_value=True)
+                        voice_dd = gr.Dropdown(label="Voice", choices=store.all_voices(),
+                                               allow_custom_value=True)
+                        pitch_box = gr.Textbox(label="Pitch", value="+0Hz")
+                        with gr.Row():
+                            apply_btn = gr.Button("Apply", variant="primary")
+                            audition_btn = gr.Button("Audition")
+                        with gr.Row():
+                            merge_dst = gr.Dropdown(label="Merge into", choices=[],
+                                                    allow_custom_value=True)
+                            merge_btn = gr.Button("Merge")
+                            delete_btn = gr.Button("Delete")
+                        audition_audio = gr.Audio(label="Preview", type="filepath",
+                                                 interactive=False)
+                        cast_status = gr.Markdown("")
+                        with gr.Row():
+                            save_cast_btn = gr.Button("Save cast")
+                            revert_btn = gr.Button("Revert to backup")
+
+                with gr.Accordion("Quotes", open=True):
+                    with gr.Row():
+                        q_chapter = gr.Dropdown(label="Chapter", choices=[],
+                                                allow_custom_value=True)
+                        q_only = gr.Checkbox(
+                            label="Only uncertain (low confidence / Unknown)", value=True)
+                    q_table = gr.Dataframe(
+                        headers=["seg", "speaker", "id", "method", "confidence", "text"],
+                        datatype=["number", "str", "str", "str", "str", "str"],
+                        interactive=False, wrap=True, max_height=340)
+                    with gr.Row():
+                        q_seg = gr.Number(label="Segment #", precision=0, value=0)
+                        q_speaker = gr.Dropdown(label="Assign to", choices=[],
+                                                allow_custom_value=True)
+                        q_assign = gr.Button("Assign", variant="primary")
+                    q_status = gr.Markdown("")
+
+            with gr.Accordion("Render this book", open=True):
+                book_run_md = gr.Markdown("No book open.")
+                with gr.Row():
+                    render_btn = gr.Button("Render / continue current book",
+                                           variant="primary", scale=3)
+                    start_over = gr.Checkbox(
+                        label="Start over", value=False, scale=1,
+                        info="Ignore saved chunks for this run only.")
+                render_warning = gr.Markdown("")
+                confirm_restart = gr.Checkbox(
+                    label="I understand this will discard saved chunks and re-render",
+                    value=False, visible=False)
+
+        # ------------------------------------------------------------ activity
+        with gr.Column(scale=2, min_width=420):
+            gr.Markdown("## Activity\n_Shared by every open book._")
+            with gr.Accordion("Runtime", open=True):
                 slots_dd = gr.Dropdown(label="Parallel renders", choices=[1, 2, 3],
-                                       value=store.queue_slots(), scale=1,
-                                       info="Each job uses Parameters → TTS concurrency.")
-                job_pick = gr.Textbox(label="Selected job (id or #)", scale=2,
-                                      placeholder="Click a job row below, or type its id",
-                                      info="Continue and Cancel act on this job.")
-                select_btn = gr.Button("Show job", scale=1)
-                cancel_all_btn = gr.Button("Cancel all jobs", scale=1)
-                clear_btn = gr.Button("Clear finished jobs", scale=1)
+                                       value=store.queue_slots(),
+                                       info="How many books may render at once.")
+                with gr.Row():
+                    runtime_conc = gr.Number(
+                        label="TTS concurrency", value=RUNTIME["concurrency"],
+                        precision=0, minimum=1, maximum=16,
+                        info="Requests per job; applies to the next job or Continue.")
+                    runtime_fail = gr.Dropdown(
+                        label="On chunk failure", choices=["stop", "skip"],
+                        value=RUNTIME["on_chunk_failure"])
+                runtime_apply_btn = gr.Button("Apply runtime settings")
+                runtime_status = gr.Markdown(
+                    "_Keep parallel renders × TTS concurrency around 12 or less._")
+                gr.Markdown("_Running jobs keep their captured runtime settings. "
+                            "Changes apply to new jobs and **Continue**._")
+
             jobs_table = gr.Dataframe(
                 headers=["id", "book", "chapters", "state", "%", "elapsed", "output"],
                 datatype=["str", "str", "str", "str", "number", "str", "str"],
                 interactive=False, wrap=True, max_height=220)
-            gr.Markdown("_Keep **parallel renders × TTS concurrency** at about 12 or less — "
-                        "Edge TTS rate-limits aggressive request counts. The queue holds a job "
-                        "back if starting it would exceed 12 in-flight requests._")
+            with gr.Row():
+                job_pick = gr.Textbox(
+                    label="Selected job (id or #)", scale=3,
+                    placeholder="Click a job row, or type its id",
+                    info="Continue and Cancel act on this job.")
+                select_btn = gr.Button("Show job", scale=1)
+            with gr.Row():
+                continue_btn = gr.Button("Continue selected job", scale=1)
+                cancel_btn = gr.Button("Cancel selected job", variant="stop", scale=1)
+            with gr.Row():
+                cancel_all_btn = gr.Button("Cancel all jobs", scale=1)
+                clear_btn = gr.Button("Clear finished jobs", scale=1)
+
             run_status = gr.Markdown("Idle — queue empty.")
             progress = gr.Slider(0, 100, value=0, label="Progress", interactive=False)
             log_box = gr.Textbox(label="Log", lines=14, max_lines=14, autoscroll=True)
@@ -1164,21 +1803,42 @@ with gr.Blocks(title="Book to Audio") as demo:
 
     # ------------------------------------------------------------- wiring
     PARAM_INPUTS = [PARAM_COMPONENTS[k] for k in PARAM_ORDER]
-    OUTPUTS_BOOK = [book_info, chapter_table, chapter_pick, q_chapter,
-                    cast_table, q_speaker, cast_note, book_status]
-    upload.change(on_upload, inputs=[upload], outputs=OUTPUTS_BOOK)
-    load_path.click(on_path_load, inputs=[path_box], outputs=OUTPUTS_BOOK)
-    pick_all.click(on_select_all, outputs=[chapter_pick])
-    pick_none.click(on_select_none, outputs=[chapter_pick])
-    analyze_btn.click(on_analyze, inputs=PARAM_INPUTS + [extra_args],
-                      outputs=[cast_table, q_speaker, q_chapter, book_status])
+    WORKSPACE_OUTPUTS = [
+        book_info, chapter_table, chapter_range, chapter_summary, book_status,
+        cast_table, cast_note, q_chapter, q_speaker, q_table, q_status,
+        extra_args, params_status, params_review, confirm_params_btn,
+        book_run_md, render_warning, confirm_restart, start_over,
+        *PARAM_INPUTS,
+    ]
+    ACTIVITY_OUTPUTS = [job_pick, run_status, progress, log_box, audio_out, download_out]
+    BOOK_OUTPUTS = [book_radio] + WORKSPACE_OUTPUTS + ACTIVITY_OUTPUTS
 
-    preview_btn.click(on_preview_command, inputs=PARAM_INPUTS + [extra_args, chapter_pick],
-                      outputs=[cmd_preview])
-    load_preset_btn.click(on_load_preset, inputs=[preset_dd],
-                          outputs=PARAM_INPUTS)
+    open_upload.change(on_open_upload, inputs=[open_upload], outputs=BOOK_OUTPUTS)
+    open_path_btn.click(on_open_path, inputs=[open_path], outputs=BOOK_OUTPUTS)
+    book_radio.input(on_switch_book, inputs=[book_radio], outputs=BOOK_OUTPUTS)
+    close_book_btn.click(on_close_book, outputs=BOOK_OUTPUTS)
+
+    range_all_btn.click(on_select_all_range, outputs=[chapter_range, chapter_summary])
+    chapter_range.change(on_range_change, inputs=[chapter_range],
+                         outputs=[chapter_summary])
+    analyze_btn.click(on_analyze,
+                      outputs=[cast_table, cast_note, q_chapter, q_speaker,
+                               book_status, book_run_md])
+
+    apply_params_btn.click(on_apply_params, inputs=PARAM_INPUTS + [extra_args],
+                           outputs=[params_status, params_review, confirm_params_btn])
+    confirm_params_btn.click(on_confirm_params,
+                             outputs=[params_status, params_review, confirm_params_btn,
+                                      book_run_md, render_warning, confirm_restart])
+    revert_params_btn.click(
+        on_revert_params,
+        outputs=[*PARAM_INPUTS, extra_args, params_status, params_review,
+                 confirm_params_btn, book_run_md, render_warning, confirm_restart],
+    )
+    load_preset_btn.click(on_load_preset, inputs=[preset_dd], outputs=PARAM_INPUTS)
     save_preset_btn.click(on_save_preset, inputs=[preset_name] + PARAM_INPUTS,
                           outputs=[preset_status, preset_dd])
+    preview_btn.click(on_preview_command, outputs=[cmd_preview])
 
     cast_table.select(on_cast_select, outputs=[row_number, cid_box, name_box, gender_dd,
                                                voice_dd, pitch_box, audition_audio])
@@ -1194,7 +1854,8 @@ with gr.Blocks(title="Book to Audio") as demo:
                        inputs=[cid_box, voice_dd, pitch_box, PARAM_COMPONENTS["rate"],
                                PARAM_COMPONENTS["engine"]],
                        outputs=[audition_audio, cast_status])
-    merge_btn.click(on_merge, inputs=[cid_box, merge_dst], outputs=[cast_table, cast_status])
+    merge_btn.click(on_merge, inputs=[cid_box, merge_dst],
+                    outputs=[cast_table, cast_status])
     delete_btn.click(on_delete, inputs=[cid_box], outputs=[cast_table, cast_status])
     save_cast_btn.click(on_save_cast, outputs=[cast_table, cast_status])
     revert_btn.click(on_revert, outputs=[cast_table, cast_status])
@@ -1205,15 +1866,27 @@ with gr.Blocks(title="Book to Audio") as demo:
     q_assign.click(on_assign, inputs=[q_seg, q_speaker, q_chapter, q_only],
                    outputs=[q_table, q_status])
 
-    render_btn.click(on_enqueue, inputs=PARAM_INPUTS + [extra_args, chapter_pick],
-                     outputs=[run_status, jobs_table, progress, log_box, run_book])
+    render_btn.click(
+        on_render,
+        inputs=[chapter_range, start_over, confirm_restart],
+        outputs=[run_status, jobs_table, progress, log_box, book_run_md,
+                 chapter_summary, params_status, render_warning,
+                 confirm_restart, start_over],
+    )
     continue_btn.click(on_continue_job, inputs=[job_pick],
-                       outputs=[run_status, jobs_table, progress, log_box, run_book])
+                       outputs=[run_status, jobs_table, progress, log_box, book_run_md])
     cancel_btn.click(on_cancel_job, inputs=[job_pick],
-                     outputs=[run_status, jobs_table])
-    cancel_all_btn.click(on_cancel_all, outputs=[run_status, jobs_table])
-    clear_btn.click(on_clear_finished, outputs=[run_status, jobs_table])
-    slots_dd.change(on_slots, inputs=[slots_dd], outputs=[run_status, jobs_table])
+                     outputs=[run_status, jobs_table, book_run_md])
+    cancel_all_btn.click(on_cancel_all,
+                         outputs=[run_status, jobs_table, book_run_md])
+    clear_btn.click(on_clear_finished,
+                    outputs=[run_status, jobs_table, book_run_md])
+    slots_dd.change(on_slots, inputs=[slots_dd],
+                    outputs=[run_status, jobs_table, book_run_md])
+    runtime_apply_btn.click(on_runtime_change,
+                            inputs=[runtime_conc, runtime_fail],
+                            outputs=[runtime_status])
+
     jobs_table.select(on_job_select,
                       outputs=[job_pick, run_status, progress, log_box,
                                audio_out, download_out])
@@ -1226,14 +1899,17 @@ with gr.Blocks(title="Book to Audio") as demo:
 
     timer = gr.Timer(1.0, active=True)
     timer.tick(on_tick, outputs=[jobs_table, run_status, progress, log_box,
-                                 audio_out, download_out, run_book])
+                                 audio_out, download_out, book_run_md])
 
-    # keep the "merge into" dropdown in sync with the cast table
     def _refresh_merge(rows):
         if not S["cast"]:
             return gr.update()
         return gr.update(choices=castlib.character_names(S["cast"], include_buckets=False))
     cast_table.change(_refresh_merge, inputs=[cast_table], outputs=[merge_dst])
+
+    # Populate the page from the restored session (and re-assert the active
+    # book after a browser refresh).
+    demo.load(_book_view, outputs=BOOK_OUTPUTS)
 
 
 def main() -> None:

@@ -145,3 +145,77 @@ def build_argv(values: Dict[str, Any], *, extra: str = "") -> List[str]:
         import shlex
         argv.extend(shlex.split(extra))
     return argv
+
+
+def default_values() -> Dict[str, Any]:
+    """A fresh set of UI values for one book."""
+    vals = {p.key: p.default for p in PARAMS}
+    vals["narrator_gender"] = ""
+    vals["voice_profile"] = ""
+    vals["fresh"] = False
+    return vals
+
+
+def _coerce(p: Param, value: Any) -> Any:
+    if p.kind == "bool":
+        return str(value).lower() not in ("0", "false", "no", "off", "")
+    if p.kind == "int":
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return p.default
+    if p.kind == "float":
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    return value
+
+
+def parse_argv(argv: List[str]) -> Dict[str, Any]:
+    """Best-effort inverse of :func:`build_argv` for saved jobs.
+
+    This lets a book reopened from an old ``meta.json`` keep the settings that
+    produced its saved chunks (especially ``max_characters`` and ``rate``).
+    """
+    vals = default_values()
+    by_flag = {p.flag: p for p in PARAMS if p.flag}
+    mode_flags = {v: k for k, v in _MODE_FLAGS.items()}
+    skip = _RESERVED | {"--analyze-only", "--list-chapters", "--list-voices", "--sample"}
+    i = 0
+    while i < len(argv):
+        tok = str(argv[i])
+        if tok in mode_flags:
+            vals["attribution_mode"] = mode_flags[tok]
+            i += 1
+            continue
+        if tok == "--fresh":
+            i += 1
+            continue
+        if tok.startswith("--") and "=" in tok:
+            flag, value = tok.split("=", 1)
+            p = by_flag.get(flag)
+            if p:
+                vals[p.key] = _coerce(p, value)
+            i += 1
+            continue
+        if tok in by_flag:
+            p = by_flag[tok]
+            if p.kind == "bool":
+                vals[p.key] = True
+                i += 1
+            elif i + 1 < len(argv):
+                vals[p.key] = _coerce(p, argv[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if tok in skip:
+            i += 2 if i + 1 < len(argv) else 1
+            continue
+        i += 1
+
+    vals["fresh"] = False
+    if vals.get("narrator_gender") in (None, "auto"):
+        vals["narrator_gender"] = ""
+    return vals
