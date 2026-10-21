@@ -210,6 +210,26 @@ def _busy_reason() -> str:
     return ""
 
 
+def _last_book_path() -> str:
+    """Path of the most recently rendered book, for the Book tab's path box."""
+    runs = ROOT / "runs"
+    best = (0.0, "")
+    if runs.is_dir():
+        for meta_path in runs.glob("*/meta.json"):
+            try:
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+                argv = data.get("last_argv") or []
+                updated = float(data.get("updated") or 0)
+                if not argv:
+                    continue
+                path = Path(argv[0])
+                if path.is_file() and updated >= best[0]:
+                    best = (updated, str(path))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+    return best[1]
+
+
 def _current_book_md() -> str:
     """Show exactly which book the Run tab will render.
 
@@ -1016,7 +1036,9 @@ with gr.Blocks(title="Book to Audio") as demo:
                     upload = gr.File(label="Upload EPUB / PDF", type="filepath",
                                      file_types=[".epub", ".pdf"])
                     path_box = gr.Textbox(label="…or a path on disk",
-                                          placeholder="/home/you/books/Book.epub")
+                                          value=_last_book_path(),
+                                          placeholder="/home/you/books/Book.epub",
+                                          info="The last rendered book is pre-filled; click Load path to reopen it.")
                     load_path = gr.Button("Load path")
                     analyze_btn = gr.Button("Analyze cast (no TTS)", variant="secondary")
                 with gr.Column(scale=2):
