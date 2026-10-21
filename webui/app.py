@@ -1018,7 +1018,8 @@ with gr.Blocks(title="Book to Audio") as demo:
                 datatype=["str", "str", "str", "str", "number", "str", "str"],
                 interactive=False, wrap=True, max_height=220)
             gr.Markdown("_Keep **parallel renders × TTS concurrency** at about 12 or less — "
-                        "Edge TTS rate-limits aggressive request counts._")
+                        "Edge TTS rate-limits aggressive request counts. The queue holds a job "
+                        "back if starting it would exceed 12 in-flight requests._")
             run_status = gr.Markdown("Idle — queue empty.")
             progress = gr.Slider(0, 100, value=0, label="Progress", interactive=False)
             log_box = gr.Textbox(label="Log", lines=14, max_lines=14, autoscroll=True)

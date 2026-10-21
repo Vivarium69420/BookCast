@@ -81,8 +81,9 @@ The Run tab runs a bounded queue instead of a single job:
 
 **Concurrency:** each job uses Parameters → **TTS concurrency** (default 6). Edge TTS is
 network-bound; 6–8 is stable on a typical home connection, 10–12 is often faster but can trigger
-HTTP 403 rate limits. Keep `parallel renders × TTS concurrency` around 12 or less. If a job fails
-with 403s, lower both and re-run — completed chunks are kept.
+HTTP 403 rate limits. Keep `parallel renders × TTS concurrency` around 12 or less; the queue also
+holds a job back if starting it would exceed 12 in-flight requests. If a job fails with 403s,
+lower both and re-run — completed chunks are kept.
 
 Each book gets a workspace under `runs/<book-slug>/`:
 

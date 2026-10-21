@@ -30,6 +30,7 @@ ERROR_RE = re.compile(r"(Traceback \(most recent call last\)|^Error|^error:|Kill
 
 STALL_SECONDS = 300
 MAX_SLOTS = 3
+GLOBAL_IN_FLIGHT = 12          # slots x per-job concurrency should stay near this
 
 
 @dataclass
@@ -227,13 +228,44 @@ class JobQueue:
 
     def _start_pending_locked(self) -> None:
         while True:
-            running = sum(1 for j in self.jobs if j.running)
-            if running >= self._slots:
+            running = [j for j in self.jobs if j.running]
+            if len(running) >= self._slots:
                 return
             nxt = next((j for j in self.jobs if j.queued), None)
             if nxt is None:
                 return
-            self._launch(nxt)
+            if running and sum(self._concurrency(j) for j in running) + \
+                    self._concurrency(nxt) > GLOBAL_IN_FLIGHT:
+                return
+            try:
+                self._launch(nxt)
+            except Exception as exc:       # pragma: no cover - defensive
+                from webui import store
+                if nxt.proc is not None:
+                    try:
+                        os.killpg(nxt.proc.pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                store.release_job_lock(nxt.spec.workdir, nxt.id)
+                nxt.error = f"could not start: {exc}"
+                nxt.returncode = -1
+                nxt.ended = time.time()
+
+    @staticmethod
+    def _concurrency(job: Job) -> int:
+        args = job.spec.args
+        for i, arg in enumerate(args):
+            value = None
+            if arg == "--concurrency" and i + 1 < len(args):
+                value = args[i + 1]
+            elif arg.startswith("--concurrency="):
+                value = arg.split("=", 1)[1]
+            if value is not None:
+                try:
+                    return max(1, int(value))
+                except (TypeError, ValueError):
+                    return 6
+        return 6
 
     def _launch(self, job: Job) -> None:
         from webui import store
