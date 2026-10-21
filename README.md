@@ -122,6 +122,33 @@ preview/      audition clips
 Edits that affect a chapter delete that chapter's cached chunks, so the next render redoes only what changed.
 Renders are resumable: cancel any time (finished chunks are kept).
 
+Global UI state lives next to the workspaces: `runs/runtime.json` (TTS concurrency / failure policy),
+`runs/queue.json` (parallel slots), `runs/session.json` (open books), and `runs/sharing.json`
+(Drive remote / phone base URL).
+
+### Sharing the output
+
+The **Share output** accordion in Activity acts on the selected job, or on the active book when no
+job is selected:
+
+- **Google Drive** runs `rclone copyto` to `<remote>:<folder>/<book title>.mp3` and remembers the
+  remote and folder in `runs/sharing.json`. Add a Google Drive remote once with `rclone config` (the
+  field defaults to `gdrive`), then check it with `rclone lsd gdrive:`. Large files can take a while;
+  the status line streams while the upload runs, so keep the tab open.
+- **Phone** builds `http://<host>:<port>/share/<slug>` and a QR code. The route serves the combined
+  `out.mp3`, falls back to a title-named MP3 from older runs, or serves a cached `out.zip` for
+  `--per-chapter` books. **Detect** fills in the best local address; edit **Base URL** to your
+  Tailscale `100.x` address to reach the phone away from home.
+
+The phone must be able to reach the Gradio server, so start it on the LAN/Tailscale interface:
+
+```bash
+./run_ui.sh --host 0.0.0.0
+```
+
+The UI has no authentication, so use this on a trusted home network or over Tailscale. If you leave
+`--host` at its loopback default, the phone link warns that the server is not reachable.
+
 **Throughput notes:** the pipeline is network-bound, not CPU-bound. Measured on a 45-chapter
 book: ~1.0 chunks/s at concurrency 6 (about 11× realtime, ~60 min for ~10.9 h of audio).
 Raising concurrency is the main lever; per-chunk ffmpeg trimming and validation are only a few

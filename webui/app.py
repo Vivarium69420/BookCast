@@ -12,12 +12,15 @@ import argparse
 import json
 import re
 import shlex
+import socket
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import gradio as gr
+from fastapi.responses import FileResponse, JSONResponse
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -33,6 +36,9 @@ from webui.job import JobQueue, JobSpec                     # noqa: E402
 
 MANAGER = JobQueue(slots=store.queue_slots())
 RUNTIME = store.runtime_settings()
+SHARING = store.sharing_settings()
+SERVER_PORT = 7860
+SERVER_HOST = "127.0.0.1"
 SELECTED_JOB: Optional[str] = None
 JOB_VIEW: List[str] = []
 LAST_AUDIO: Optional[tuple] = None
@@ -1512,6 +1518,163 @@ def on_runtime_change(concurrency, on_chunk_failure):
             f"captured settings.")
 
 
+# --------------------------------------------------------------------------
+# sharing: rclone/Google Drive + phone download link + QR
+# --------------------------------------------------------------------------
+
+def _local_ips() -> List[str]:
+    """Reachable physical IPv4 addresses, LAN first, then Tailscale."""
+    ips: List[str] = []
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
+                             capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            m = re.match(r"\d+:\s+(\S+)\s+inet (\d+\.\d+\.\d+\.\d+)", line)
+            if not m:
+                continue
+            iface, ip = m.group(1), m.group(2)
+            if iface == "lo" or iface.startswith(("docker", "br-", "veth")):
+                continue
+            ips.append(ip)
+    except (OSError, subprocess.SubprocessError):
+        ips = []
+    if not ips:
+        try:
+            out = subprocess.run(["hostname", "-I"], capture_output=True,
+                                 text=True, timeout=3).stdout
+            ips = out.split()
+        except (OSError, subprocess.SubprocessError):
+            ips = []
+    ips = [ip for ip in ips if ip and not ip.startswith("127.")]
+    if not ips:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ips = [s.getsockname()[0]]
+        except OSError:
+            ips = []
+        finally:
+            s.close()
+
+    def rank(ip: str) -> int:
+        if ip.startswith(("192.168.", "10.", "172.")):  # private LAN
+            return 0
+        if ip.startswith("100."):                       # Tailscale CGNAT
+            return 1
+        return 2
+    return sorted(dict.fromkeys(ips), key=rank)
+
+
+def _autodetect_base() -> str:
+    ips = _local_ips()
+    return f"http://{ips[0] if ips else '127.0.0.1'}:{SERVER_PORT}"
+
+
+def _make_qr(url: str, slug: str) -> Optional[str]:
+    qdir = store.RUNS / "share"
+    try:
+        qdir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    out_png = qdir / f"qr_{slug}.png"
+    try:
+        subprocess.run(["qrencode", "-o", str(out_png), "-s", "6", "-m", "2", url],
+                       check=True, capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return str(out_png)
+
+
+def _share_target(selector: str):
+    """The job (if any) and workspace owning the output to share."""
+    job = _resolve_job(selector)
+    if job is not None:
+        return job, Path(job.spec.workdir).parent
+    ws = S.get("ws")
+    return None, Path(ws) if ws else None
+
+
+def on_detect_base():
+    return _autodetect_base()
+
+
+def on_phone_link(selector, base_url, request: gr.Request = None):
+    job, ws = _share_target(selector)
+    if not ws:
+        return "", None, "Open a book or select a finished job first.", gr.skip()
+    file = store.output_for_sharing(ws)
+    if not file:
+        return "", None, ("No finished MP3 yet for this book. Render it first, "
+                          "or click a finished job's row."), gr.skip()
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        port = SERVER_PORT
+        if request is not None:
+            host = request.headers.get("host") or ""
+            if ":" in host:
+                port = host.rsplit(":", 1)[1]
+        ips = _local_ips()
+        base = f"http://{ips[0] if ips else '127.0.0.1'}:{port}"
+    url = f"{base}/share/{ws.name}"
+    qr = _make_qr(url, ws.name)
+    store.save_sharing_settings(base_url=base)
+    size_mb = file.stat().st_size / 1048576
+    lines = [f"Scan the QR, or open the link on your phone. "
+             f"File: `{store.share_name(ws, file)}` ({size_mb:.1f} MB)."]
+    if job is not None and job.state in ("queued", "running", "stalled"):
+        lines.append("⚠ This job is still running; the link serves the current file.")
+    port = urlparse(base).port or SERVER_PORT
+    alternates = [f"http://{ip}:{port}" for ip in _local_ips()
+                  if f"http://{ip}:{port}" != base]
+    if alternates:
+        lines.append("Other addresses to try: " + ", ".join(f"`{b}`" for b in alternates))
+    if qr is None:
+        lines.append("_Could not build a QR (`qrencode` missing); use the URL above._")
+    if SERVER_HOST in ("127.0.0.1", "localhost", "::1"):
+        lines.append("⚠ The UI is bound to loopback, so your phone cannot reach it. "
+                     "Restart with `./run_ui.sh --host 0.0.0.0` (or bind to your "
+                     "Tailscale address).")
+    return url, qr, "\n\n".join(lines), base
+
+
+def on_drive_upload(selector, remote, path):
+    job, ws = _share_target(selector)
+    file = store.output_for_sharing(ws) if ws else None
+    if not file:
+        yield "Nothing to upload yet — render a book, or click a finished job's row."
+        return
+    remote = (remote or "").strip()
+    folder = (path or "").strip().strip("/")
+    if not remote:
+        yield ("Set an **rclone remote** first (for example `gdrive`). Create it once "
+               "with `rclone config` → Google Drive, then check it with "
+               "`rclone lsd gdrive:`.")
+        return
+    name = store.share_name(ws, file)
+    target = f"{remote}:{folder}/{name}" if folder else f"{remote}:{name}"
+    store.save_sharing_settings(drive_remote=remote, drive_path=folder)
+    size_mb = file.stat().st_size / 1048576
+    note = ""
+    if job is not None and job.state in ("queued", "running", "stalled"):
+        note = " (job still running — uploading the current file)"
+    yield (f"⏳ Uploading `{name}` ({size_mb:.1f} MB) to `{target}`{note}… "
+           f"Keep this tab open until it finishes.")
+    cmd = ["rclone", "copyto", str(file), target, "--stats", "0", "--stats-one-line"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    except FileNotFoundError:
+        yield "❌ `rclone` is not installed. Install it, then run `rclone config`."
+        return
+    except subprocess.TimeoutExpired:
+        yield "❌ Upload timed out after 60 minutes."
+        return
+    if proc.returncode == 0:
+        yield f"✅ Uploaded to `{target}` — open Google Drive on any device to fetch it."
+    else:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        yield f"❌ rclone failed (exit {proc.returncode}): `{tail[-1] if tail else 'unknown'}`"
+
+
 def on_job_select(evt: gr.SelectData):
     global SELECTED_JOB
     row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
@@ -1801,6 +1964,31 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                 audio_out = gr.Audio(label="Output", type="filepath", interactive=False)
                 download_out = gr.File(label="Download")
 
+            with gr.Accordion("Share output", open=False):
+                gr.Markdown("### Google Drive\n_Uses your local `rclone` config._")
+                with gr.Row():
+                    drive_remote = gr.Textbox(
+                        label="rclone remote", value=SHARING["drive_remote"],
+                        info="Create once with `rclone config` (Google Drive).")
+                    drive_path = gr.Textbox(
+                        label="Folder on Drive", value=SHARING["drive_path"])
+                drive_btn = gr.Button("Upload selected output to Drive")
+                drive_status = gr.Markdown(
+                    "_Check a remote with `rclone lsd <remote>:`._")
+
+                gr.Markdown("### Phone\n_Scan to download directly._")
+                with gr.Row():
+                    share_base = gr.Textbox(
+                        label="Base URL for your phone", value=SHARING["base_url"],
+                        placeholder="http://192.168.1.10:7860", scale=4)
+                    detect_btn = gr.Button("Detect", scale=1)
+                phone_btn = gr.Button("Create phone link + QR")
+                share_url = gr.Textbox(label="Phone URL", interactive=False)
+                qr_image = gr.Image(label="QR", type="filepath", height=220,
+                                    interactive=False, show_download_button=False)
+                phone_status = gr.Markdown(
+                    "_The phone must share your Wi-Fi or be on your Tailscale network._")
+
     # ------------------------------------------------------------- wiring
     PARAM_INPUTS = [PARAM_COMPONENTS[k] for k in PARAM_ORDER]
     WORKSPACE_OUTPUTS = [
@@ -1887,6 +2075,12 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                             inputs=[runtime_conc, runtime_fail],
                             outputs=[runtime_status])
 
+    detect_btn.click(on_detect_base, outputs=[share_base])
+    phone_btn.click(on_phone_link, inputs=[job_pick, share_base],
+                    outputs=[share_url, qr_image, phone_status, share_base])
+    drive_btn.click(on_drive_upload, inputs=[job_pick, drive_remote, drive_path],
+                    outputs=[drive_status])
+
     jobs_table.select(on_job_select,
                       outputs=[job_pick, run_status, progress, log_box,
                                audio_out, download_out])
@@ -1912,16 +2106,55 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
     demo.load(_book_view, outputs=BOOK_OUTPUTS)
 
 
+def _share_route(slug: str):
+    """Serve a book's finished MP3 (or per-chapter zip) to a phone/browser."""
+    runs = store.RUNS.resolve()
+    try:
+        ws = (store.RUNS / slug).resolve()
+    except OSError:
+        return JSONResponse({"error": "bad path"}, status_code=400)
+    if ws != runs and runs not in ws.parents:
+        return JSONResponse({"error": "bad path"}, status_code=400)
+    if not ws.is_dir():
+        return JSONResponse({"error": "no such book"}, status_code=404)
+    f = store.output_for_sharing(ws)
+    if not f or not f.exists():
+        return JSONResponse({"error": "no output yet"}, status_code=404)
+    media = "audio/mpeg" if f.suffix == ".mp3" else "application/zip"
+    return FileResponse(str(f), media_type=media, filename=store.share_name(ws, f))
+
+
+_SHARE_ROUTE_ADDED = False
+
+
+def _register_share_route(app) -> None:
+    """Attach /share/{slug} to the app Gradio builds during launch()."""
+    global _SHARE_ROUTE_ADDED
+    if _SHARE_ROUTE_ADDED:
+        return
+    app.add_api_route("/share/{slug}", _share_route, methods=["GET", "HEAD"],
+                      name="share_output")
+    _SHARE_ROUTE_ADDED = True
+
+
 def main() -> None:
     import argparse as _argparse
+    global SERVER_PORT, SERVER_HOST
     ap = _argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--share", action="store_true", help="Public Gradio link (Colab)")
     ap.add_argument("--no-browser", action="store_true")
     a = ap.parse_args()
+    SERVER_PORT = a.port
+    SERVER_HOST = a.host
+    # Launch without blocking so we can add the phone-download route to the
+    # FastAPI app Gradio only creates inside launch().
     demo.launch(server_name=a.host, server_port=a.port, share=a.share,
-                inbrowser=not a.no_browser, show_error=True, max_file_size="2gb")
+                inbrowser=not a.no_browser, show_error=True, max_file_size="2gb",
+                prevent_thread_lock=True)
+    _register_share_route(demo.app)
+    demo.block_thread()
 
 
 if __name__ == "__main__":

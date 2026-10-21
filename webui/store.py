@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -103,6 +104,12 @@ def list_outputs(ws: Path) -> List[Path]:
     outdir = ws / "out"
     if outdir.is_dir():
         files.extend(sorted(p for p in outdir.glob("*.mp3") if p.stat().st_size > 0))
+    # Older/manual runs may have written a title-named file (e.g. "Book.mp3")
+    # instead of out.mp3; keep those visible too.
+    named = sorted((p for p in ws.glob("*.mp3")
+                    if p.name != "out.mp3" and p.stat().st_size > 0),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    files.extend(p for p in named if p not in files)
     return files
 
 
@@ -403,3 +410,97 @@ def save_runtime_settings(concurrency: int, on_chunk_failure: str) -> Dict[str, 
     RUNS.mkdir(parents=True, exist_ok=True)
     RUNTIME_SETTINGS.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return data
+
+
+# --------------------------------------------------------------------------
+# Sharing: rclone/Google Drive + phone download link + QR
+# --------------------------------------------------------------------------
+
+SHARING_SETTINGS = RUNS / "sharing.json"
+
+SHARING_DEFAULTS: Dict[str, Any] = {
+    "drive_remote": "gdrive",     # an `rclone config` remote name
+    "drive_path": "BookToAudio",  # folder inside that remote
+    "base_url": "",               # e.g. http://100.64.0.1:7860 (Tailscale/LAN)
+}
+
+
+def sharing_settings() -> Dict[str, Any]:
+    data = dict(SHARING_DEFAULTS)
+    if SHARING_SETTINGS.exists():
+        try:
+            loaded = json.loads(SHARING_SETTINGS.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                for key in SHARING_DEFAULTS:
+                    value = loaded.get(key)
+                    if isinstance(value, str):
+                        data[key] = value
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    return data
+
+
+def save_sharing_settings(**kw: Any) -> Dict[str, Any]:
+    data = sharing_settings()
+    for key, value in kw.items():
+        if key in SHARING_DEFAULTS and value is not None:
+            data[key] = str(value)
+    RUNS.mkdir(parents=True, exist_ok=True)
+    SHARING_SETTINGS.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return data
+
+
+def output_for_sharing(ws: Path) -> Optional[Path]:
+    """The single file to send to Drive or the phone.
+
+    Prefers the combined ``out.mp3``; for ``--per-chapter`` books it caches a
+    STORED (no recompress) zip of ``out/*.mp3`` next to the workspace.
+    """
+    ws = Path(ws)
+    single = ws / "out.mp3"
+    if single.exists() and single.stat().st_size > 0:
+        return single
+    outdir = ws / "out"
+    if outdir.is_dir():
+        files = sorted(p for p in outdir.glob("*.mp3") if p.stat().st_size > 0)
+        if files:
+            zip_path = ws / "out.zip"
+            newest = max(p.stat().st_mtime for p in files)
+            if not zip_path.exists() or zip_path.stat().st_mtime < newest:
+                tmp = zip_path.with_suffix(".zip.tmp")
+                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
+                    for p in files:
+                        z.write(p, arcname=p.name)
+                tmp.replace(zip_path)
+            return zip_path
+    # Fall back to a title-named MP3 written by an older/manual run.
+    named = [p for p in ws.glob("*.mp3") if p.stat().st_size > 0]
+    if named:
+        return max(named, key=lambda p: p.stat().st_size)
+    return None
+
+
+_UNSAFE_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+
+
+def share_name(ws: Path, f: Optional[Path] = None) -> str:
+    """A human-readable download name (book title) for the shared file."""
+    ws = Path(ws)
+    if f is None:
+        f = output_for_sharing(ws)
+    if f is None:
+        return f"{ws.name}.mp3"
+    f = Path(f)
+    if f.suffix == ".zip":
+        return f.name
+    if f.name != "out.mp3":
+        return f.name
+    title = ""
+    prog = ws / "work" / "progress.json"
+    if prog.exists():
+        try:
+            title = json.loads(prog.read_text(encoding="utf-8")).get("book_title") or ""
+        except (OSError, ValueError, json.JSONDecodeError):
+            title = ""
+    clean = re.sub(r"\s+", " ", _UNSAFE_NAME.sub(" ", title)).strip()
+    return f"{clean or ws.name}{f.suffix or '.mp3'}"

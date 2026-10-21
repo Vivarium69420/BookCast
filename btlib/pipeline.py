@@ -317,7 +317,9 @@ def run(args):
             shutil.copyfile(comb, ch_out)
             store.mark_chapter_output_done(idx)
 
-    if not args.per_chapter and not store.is_final_done():
+    if not args.per_chapter and (not store.is_final_done()
+                                 or not out_path.exists()
+                                 or out_path.stat().st_size == 0):
         # With --chapters, only the selected chapters were synthesized; the
         # others have no combined file and must not be referenced.
         all_comb = [store.chapter_combined_path(c["index"])
