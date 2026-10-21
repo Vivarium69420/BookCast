@@ -88,8 +88,9 @@ PARAMS: List[Param] = [
     # ---------------------------------------------------------------- output
     Param("per_chapter", "One MP3 per chapter", "bool", False,
           "--per-chapter", [], "Writes a directory instead of a single file.", "Output"),
-    Param("concurrency", "TTS concurrency", "int", 4, "--concurrency", [],
-          "Parallel edge-tts requests.", "Output"),
+    Param("concurrency", "TTS concurrency", "int", 6, "--concurrency", [],
+          "Parallel edge-tts requests. 6 is stable; 8-10 is often faster but can hit 403s.",
+          "Output", minimum=1, maximum=16),
     Param("on_chunk_failure", "On chunk failure", "choice", "stop",
           "--on-chunk-failure", ["stop", "skip"], "", "Output"),
     Param("fresh", "Ignore saved progress", "bool", False,

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import time
@@ -145,6 +146,153 @@ def invalidate_chapters(ws: Path, chapters: Iterable[int]) -> List[int]:
         # the combined file is now stale
         (ws / "out.mp3").unlink(missing_ok=True)
     return done
+
+
+# --------------------------------------------------------------------------
+# Render queue: settings, per-job logs, workspace locks
+# --------------------------------------------------------------------------
+
+QUEUE_SETTINGS = RUNS / "queue.json"
+
+
+def queue_slots(default: int = 2) -> int:
+    if QUEUE_SETTINGS.exists():
+        try:
+            n = int(json.loads(QUEUE_SETTINGS.read_text(encoding="utf-8")).get("slots", default))
+            return max(1, min(3, n))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    return default
+
+
+def save_queue_slots(slots: int) -> int:
+    n = max(1, min(3, int(slots)))
+    RUNS.mkdir(parents=True, exist_ok=True)
+    QUEUE_SETTINGS.write_text(json.dumps({"slots": n}, indent=2), encoding="utf-8")
+    return n
+
+
+def job_log_path(ws: Path, job_id: str) -> Path:
+    return ws / "logs" / f"{job_id}.log"
+
+
+def job_lock_path(workdir: Path) -> Path:
+    return Path(workdir) / ".ui-job.json"
+
+
+def read_job_lock(workdir: Path) -> Dict[str, Any]:
+    p = job_lock_path(workdir)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _pid_alive(pid: Any) -> bool:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[2]
+        return state != "Z"
+    except OSError:
+        return True
+
+
+def _cmdline(pid: int) -> List[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
+
+
+def external_render_pid(workdir: Path) -> Optional[int]:
+    """PID of a CLI process already rendering this workdir, if any.
+
+    This also catches a render orphaned by a UI restart, which has no lock
+    file because it was started by an older version of the UI.
+    """
+    target = str(Path(workdir).resolve())
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        args = _cmdline(pid)
+        if not any(a.endswith("book_to_audio.py") for a in args):
+            continue
+        for i, arg in enumerate(args):
+            value = None
+            if arg == "--workdir" and i + 1 < len(args):
+                value = args[i + 1]
+            elif arg.startswith("--workdir="):
+                value = arg.split("=", 1)[1]
+            if value and str(Path(value).resolve()) == target:
+                return pid
+    return None
+
+
+def acquire_job_lock(workdir: Path, job_id: str) -> tuple:
+    """Claim a workspace. Returns (ok, reason). Stale locks are reclaimed."""
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    pid = external_render_pid(workdir)
+    if pid:
+        return False, f"PID {pid} is already rendering this workspace"
+    info = read_job_lock(workdir)
+    if info and info.get("job_id") != job_id and _pid_alive(info.get("pid")):
+        return False, f"job {info.get('job_id')} is still running as PID {info.get('pid')}"
+    lock = job_lock_path(workdir)
+    tmp = lock.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({
+        "job_id": job_id, "pid": None, "started": time.time(),
+    }, indent=2), encoding="utf-8")
+    tmp.replace(lock)
+    return True, ""
+
+
+def update_job_lock(workdir: Path, job_id: str, pid: int) -> None:
+    info = read_job_lock(workdir)
+    if info.get("job_id") != job_id:
+        return
+    info["pid"] = int(pid)
+    lock = job_lock_path(workdir)
+    tmp = lock.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(info, indent=2), encoding="utf-8")
+    tmp.replace(lock)
+
+
+def release_job_lock(workdir: Path, job_id: str) -> None:
+    info = read_job_lock(workdir)
+    if info.get("job_id") == job_id:
+        job_lock_path(workdir).unlink(missing_ok=True)
+
+
+def job_outputs(spec: Any) -> List[Path]:
+    out = Path(spec.out_path)
+    try:
+        if getattr(spec, "per_chapter", False):
+            if out.is_dir():
+                return sorted(p for p in out.glob("*.mp3") if p.stat().st_size > 0)
+            return []
+        return [out] if out.exists() and out.stat().st_size > 0 else []
+    except OSError:
+        return []
 
 
 # --------------------------------------------------------------------------

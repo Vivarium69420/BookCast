@@ -62,20 +62,47 @@ Workflow:
 3. **Cast** – edit names/genders/voices/pitch, merge or delete characters, audition a line.
    Changing a gender offers the first unused voice from that gender's pool; any voice can be overridden.
    **Quotes** below lists each dialogue line (optionally only uncertain ones) and lets you reassign it.
-4. **Run** – pick chapters, render, watch the log/progress, download the MP3.
+4. **Run** – pick chapters, **Add to queue**, watch the jobs table/log/progress, download the MP3.
+
+### Render queue
+
+The Run tab runs a bounded queue instead of a single job:
+
+- **Parallel renders** (1–3, default 2) controls how many jobs run at once. Waiting jobs start
+  automatically; you can load and edit another book while renders run.
+- Every job keeps its own log (`runs/<slug>/logs/<job-id>.log`), progress, and output.
+- Select a row (or type its id / queue number) to show that job's status, log, audio, and download.
+- **Cancel selected** stops one job; **Cancel all** stops the queue; **Clear finished** tidies the table.
+- A book can only have one queued/running job. The UI also writes a PID lock in
+  `runs/<slug>/work/.ui-job.json`, so two UI instances (or a UI restarted while a CLI render is
+  still running) cannot write to the same workspace.
+- Cast/quote edits are blocked while that book is rendering. Queued jobs read the cast when they
+  start, so editing before then is fine.
+
+**Concurrency:** each job uses Parameters → **TTS concurrency** (default 6). Edge TTS is
+network-bound; 6–8 is stable on a typical home connection, 10–12 is often faster but can trigger
+HTTP 403 rate limits. Keep `parallel renders × TTS concurrency` around 12 or less. If a job fails
+with 403s, lower both and re-run — completed chunks are kept.
 
 Each book gets a workspace under `runs/<book-slug>/`:
 
 ```
 cast.json     editable cast (always passed to the CLI as --cast-file)
-work/         chunks + progress.json (--workdir)
+work/         chunks + progress.json (--workdir); .ui-job.json lock while rendering
 out.mp3       combined output, or out/ with --per-chapter
-log.txt       last run log
+logs/         one log per queued job (<job-id>.log)
+meta.json     last parameters / last job
 preview/      audition clips
 ```
 
 Edits that affect a chapter delete that chapter's cached chunks, so the next render redoes only what changed.
 Renders are resumable: cancel any time (finished chunks are kept).
+
+**Throughput notes:** the pipeline is network-bound, not CPU-bound. Measured on a 45-chapter
+book: ~1.0 chunks/s at concurrency 6 (about 11× realtime, ~60 min for ~10.9 h of audio).
+Raising concurrency is the main lever; per-chunk ffmpeg trimming and validation are only a few
+percent. Resume checks now use a size check instead of fully decoding every completed chunk,
+which makes restarting a long book much faster.
 
 ## Basic usage
 

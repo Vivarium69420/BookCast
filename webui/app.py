@@ -25,9 +25,12 @@ from btlib.pipeline import extract_book                     # noqa: E402
 from webui import cast as castlib                           # noqa: E402
 from webui import params as pspec                           # noqa: E402
 from webui import preview, store                            # noqa: E402
-from webui.job import JobManager                            # noqa: E402
+from webui.job import JobQueue, JobSpec                     # noqa: E402
 
-MANAGER = JobManager()
+MANAGER = JobQueue(slots=store.queue_slots())
+SELECTED_JOB: Optional[str] = None
+JOB_VIEW: List[str] = []
+LAST_AUDIO: Optional[tuple] = None
 S: Dict[str, Any] = {
     "book": None,
     "path": None,
@@ -35,7 +38,6 @@ S: Dict[str, Any] = {
     "cast": None,
     "texts": {},
     "dirty": set(),
-    "audio": None,
 }
 
 CAST_SAVED_RE = re.compile(
@@ -129,6 +131,9 @@ def _analyze_now(values: Dict[str, Any], extra: str = "") -> tuple:
     """Run --analyze-only synchronously and copy the cast into the workspace."""
     if not S["path"] or not S["ws"]:
         return False, "Load a book first."
+    busy = _busy_reason()
+    if busy:
+        return False, f"Cannot analyze: {busy}."
     argv = [str(S["path"]), "--analyze-only"] + _base_argv(values, extra)
     try:
         proc = _run_sync(argv)
@@ -191,13 +196,139 @@ def _chapters_for(cid: str) -> List[int]:
     return out
 
 
+def _busy_reason() -> str:
+    """Why this book's workspace cannot be edited/rendered right now."""
+    ws = S.get("ws")
+    if not ws:
+        return ""
+    job = MANAGER.running_for(ws / "work")
+    if job:
+        return f"job `{job.spec.short()}` is rendering this book"
+    pid = store.external_render_pid(ws / "work")
+    if pid:
+        return f"another process (PID {pid}) is rendering this book"
+    return ""
+
+
 def _invalidate(chapters) -> str:
+    if _busy_reason():
+        return ""
     chapters = set(chapters) & S.get("dirty", set())
     if not chapters:
         return ""
     done = store.invalidate_chapters(S["ws"], chapters)
     S["dirty"] -= set(done)
     return f" (re-render: {', '.join(map(str, done))})" if done else ""
+
+
+# --------------------------------------------------------------------------
+# render queue helpers
+# --------------------------------------------------------------------------
+
+def _jobs_rows() -> List[List[Any]]:
+    global JOB_VIEW
+    jobs = MANAGER.jobs
+    JOB_VIEW = [j.id for j in jobs]
+    rows = []
+    for j in jobs:
+        snap = j.snapshot()
+        out = Path(j.spec.out_path).name + ("/" if j.spec.per_chapter else "")
+        rows.append([
+            j.spec.short(), j.spec.title[:46], j.spec.chapters or "all",
+            snap["state"], round(snap["percent"]), f"{snap['elapsed']:.0f}s", out,
+        ])
+    return rows
+
+
+def _selected_job():
+    if SELECTED_JOB:
+        job = MANAGER.get(SELECTED_JOB)
+        if job is not None:
+            return job
+    running = [j for j in MANAGER.jobs if j.state in ("running", "stalled")]
+    return running[0] if running else (MANAGER.jobs[-1] if MANAGER.jobs else None)
+
+
+def _resolve_job(value: str):
+    raw = str(value or "").strip()
+    jobs = MANAGER.jobs
+    if not raw:
+        return _selected_job()
+    for job in jobs:
+        if job.id == raw:
+            return job
+    matches = [j for j in jobs if j.id.startswith(raw)]
+    if len(matches) == 1:
+        return matches[0]
+    try:
+        i = int(raw) - 1
+        if 0 <= i < len(jobs):
+            return jobs[i]
+    except ValueError:
+        pass
+    return None
+
+
+def _queue_summary() -> str:
+    jobs = MANAGER.jobs
+    running = sum(1 for j in jobs if j.state in ("running", "stalled"))
+    queued = sum(1 for j in jobs if j.state == "queued")
+    return f"{running}/{MANAGER.slots} running · {queued} queued"
+
+
+def _job_status(job) -> str:
+    snap = job.snapshot()
+    state = snap["state"]
+    lines = [f"### {job.spec.title}", f"Job `{job.spec.short()}` · chapters {job.spec.chapters or 'all'}"]
+    if state == "queued":
+        pos = MANAGER.position(job.id)
+        lines.append(f"**Queued** · position {pos} · waiting {snap['queued_for']:.0f}s")
+    elif state == "running":
+        lines.append(f"**Running** · {snap['elapsed']:.0f}s")
+    elif state == "stalled":
+        lines.append(f"**Stalled** · no output for 5+ minutes · {snap['elapsed']:.0f}s")
+    elif state == "cancelled":
+        lines.append(f"**Cancelled** · {snap['elapsed']:.0f}s — finished chunks are kept")
+    elif state == "done":
+        lines.append(f"**Finished** (exit {snap['returncode']}) · {snap['elapsed']:.0f}s")
+    else:
+        lines.append(f"**Failed** (exit {snap['returncode']}) · {snap['elapsed']:.0f}s")
+
+    if snap["chapter_total"]:
+        lines.append(f"Chapter {snap['chapter_index']}/{snap['chapter_total']}: "
+                     f"{snap['chapter_title']}")
+        lines.append(f"Chunk {snap['chunk_done']}/{snap['chunk_total']}")
+    if state == "stalled":
+        lines.append("⚠ **No output for 5+ minutes** — the TTS request may be stuck. "
+                     "Cancel this job and re-run; finished chunks are kept.")
+    if snap["error"] and not snap.get("cancelled"):
+        lines.append(f"❌ `{snap['error']}`")
+    outs = store.job_outputs(job.spec) if job.done else []
+    if outs:
+        lines.append(f"Output: `{outs[0]}`" + (f" (+{len(outs) - 1} more)" if len(outs) > 1 else ""))
+    lines.append(f"Queue: {_queue_summary()}")
+    return "\n\n".join(lines)
+
+
+def _job_view(job, force_audio: bool = False):
+    global LAST_AUDIO
+    status = _job_status(job)
+    pct = job.percent()
+    log = "\n".join(job.lines)[-20000:]
+    outs = [str(p) for p in store.job_outputs(job.spec)] if job.done else []
+    audio = gr.skip()
+    download = gr.skip()
+    if outs:
+        key = (job.id, tuple(outs))
+        if force_audio or key != LAST_AUDIO:
+            LAST_AUDIO = key
+            audio = outs[0]
+            download = outs if len(outs) > 1 else outs[0]
+    elif force_audio:
+        LAST_AUDIO = None
+        audio = gr.update(value=None)
+        download = gr.update(value=None)
+    return status, pct, log, audio, download
 
 
 # --------------------------------------------------------------------------
@@ -297,6 +428,9 @@ def on_analyze(*args):
     extra = args[-1] if args else ""
     if not S["path"]:
         return gr.update(), gr.update(), gr.update(), "Load a book first."
+    busy = _busy_reason()
+    if busy:
+        return gr.update(), gr.update(), gr.update(), f"**Cannot analyze: {busy}.**"
     ok, msg = _analyze_now(values, extra)
     if not ok or not S["cast"]:
         return gr.update(), gr.update(), gr.update(), f"**{msg}**"
@@ -401,6 +535,9 @@ def on_gender_change(cid: str, gender: str, profile: str = ""):
 def on_apply(cid: str, name: str, gender: str, voice: str, pitch: str):
     if not S["cast"] or not cid:
         return gr.update(), "No character selected."
+    busy = _busy_reason()
+    if busy:
+        return gr.update(), f"**Cannot edit: {busy}.**"
     data = S["cast"]
     old = castlib.find(data, cid) or {}
     gender = gender or None
@@ -428,6 +565,9 @@ def on_apply(cid: str, name: str, gender: str, voice: str, pitch: str):
 def on_merge(src_label: str, dst_label: str):
     if not S["cast"]:
         return gr.update(), "No cast."
+    busy = _busy_reason()
+    if busy:
+        return gr.update(), f"**Cannot edit: {busy}.**"
     src = (src_label or "").split("\t")[0]
     dst = (dst_label or "").split("\t")[0]
     data = S["cast"]
@@ -447,6 +587,9 @@ def on_merge(src_label: str, dst_label: str):
 def on_delete(cid: str):
     if not S["cast"] or not cid:
         return gr.update(), "No character selected."
+    busy = _busy_reason()
+    if busy:
+        return gr.update(), f"**Cannot edit: {busy}.**"
     chapters = _chapters_for(cid)
     ok, msg = castlib.delete(S["cast"], cid)
     if not ok:
@@ -473,6 +616,9 @@ def on_audition(cid: str, voice: str, pitch: str, rate: str, engine: str):
 def on_save_cast():
     if not S["cast"]:
         return gr.update(), "No cast."
+    busy = _busy_reason()
+    if busy:
+        return gr.update(), f"**Cannot edit: {busy}.**"
     castlib.save(S["ws"], S["cast"])
     note = _invalidate(S["dirty"])
     rows, spk, qs = _reload_cast(S["cast"])
@@ -482,6 +628,9 @@ def on_save_cast():
 def on_revert():
     if not S["ws"]:
         return gr.update(), "No workspace."
+    busy = _busy_reason()
+    if busy:
+        return gr.update(), f"**Cannot edit: {busy}.**"
     bak = store.cast_path(S["ws"]).with_suffix(".json.bak")
     if not bak.exists():
         return gr.update(), "No backup yet."
@@ -542,6 +691,9 @@ def on_q_select(evt: gr.SelectData, chapter_label: str = "", only: bool = True):
 def on_assign(seg, speaker_label: str, chapter_label: str = "", only: bool = True):
     if not S["cast"]:
         return gr.update(), "No cast."
+    busy = _busy_reason()
+    if busy:
+        return gr.update(), f"**Cannot edit: {busy}.**"
     key = str(_label_index(chapter_label) or "")
     if not key:
         return gr.update(), "Pick a chapter."
@@ -567,22 +719,31 @@ def on_assign(seg, speaker_label: str, chapter_label: str = "", only: bool = Tru
 # run tab
 # --------------------------------------------------------------------------
 
-def on_render(*args):
+def on_enqueue(*args):
+    global SELECTED_JOB
     values = _values_from(args[:-2])
     extra = args[-2] if len(args) >= 2 else ""
     chapters = args[-1] if args else []
-    if not S["path"]:
-        return "Load a book first.", 0.0, ""
-    if MANAGER.current and MANAGER.current.running:
-        snap = MANAGER.snapshot()
-        return f"**A job is already running** ({snap['kind']}).", snap["percent"], snap["log"]
+    rows = _jobs_rows()
+    if not S["path"] or not S["ws"]:
+        return "Load a book first.", rows, 0.0, ""
+
+    workdir = S["ws"] / "work"
+    busy = MANAGER.has_workspace(workdir)
+    if busy:
+        return (f"**Already {busy.state}** as job `{busy.spec.short()}`. "
+                f"Cancel it first, or wait for it to finish."), rows, 0.0, ""
+    pid = store.external_render_pid(workdir)
+    if pid:
+        return (f"**PID {pid} is already rendering this book.** "
+                f"Wait for it to finish (or stop that process) before queuing another."), rows, 0.0, ""
 
     if not store.cast_path(S["ws"]).exists():
         ok, msg = _analyze_now(values, extra)
         if not ok:
-            return f"**{msg}**", 0.0, msg
+            return f"**{msg}**", rows, 0.0, msg
     if not store.cast_path(S["ws"]).exists():
-        return "No cast file — run Analyze first.", 0.0, ""
+        return "No cast file — run Analyze first.", rows, 0.0, ""
 
     per_chapter = bool(values.get("per_chapter"))
     out = store.out_path(S["ws"], per_chapter)
@@ -590,67 +751,115 @@ def on_render(*args):
         out.mkdir(parents=True, exist_ok=True)
     argv = [str(S["path"])] + _base_argv(values, extra)
     argv += ["--cast-file", str(store.cast_path(S["ws"])),
-             "--workdir", str(S["ws"] / "work"), "-o", str(out)]
+             "--workdir", str(workdir), "-o", str(out)]
     spec = _chapter_spec(chapters, len(S["book"].chapters) if S["book"] else 0)
     if spec:
         argv += ["--chapters", spec]
 
-    store.save_meta(S["ws"], last_argv=argv, chapters=spec, per_chapter=per_chapter)
+    job_spec = JobSpec(
+        book=S["path"], title=S["book"].title,
+        cast_file=store.cast_path(S["ws"]), workdir=workdir,
+        out_path=out, args=argv, chapters=spec, per_chapter=per_chapter,
+    )
+    store.save_meta(S["ws"], last_argv=argv, chapters=spec,
+                    per_chapter=per_chapter, last_job=job_spec.id)
     try:
-        MANAGER.start("render", argv, cwd=ROOT, log_path=S["ws"] / "log.txt")
+        job = MANAGER.enqueue(job_spec, cwd=ROOT,
+                              log_path=store.job_log_path(S["ws"], job_spec.id))
     except Exception as exc:
-        return f"**Could not start:** `{exc}`", 0.0, ""
-    return (f"Started. Chapters: {spec or 'all'} · output `{out}`\n"
-            f"```\npython book_to_audio.py {shlex.join(argv)}\n```"), 0.0, ""
+        return f"**Could not queue:** `{exc}`", rows, 0.0, ""
+    SELECTED_JOB = job.id
+    rows = _jobs_rows()
+    if job.state == "queued":
+        pos = MANAGER.position(job.id)
+        head = f"**Queued** `{job.spec.short()}` (position {pos})."
+    elif job.state in ("running", "stalled"):
+        head = f"**Started** `{job.spec.short()}`."
+    else:
+        head = f"**Job `{job.spec.short()}` failed:** `{job.error}`"
+    return (f"{head} Chapters: {spec or 'all'} · output `{out}`\n"
+            f"```\npython book_to_audio.py {shlex.join(argv)}\n```"), rows, 0.0, ""
 
 
-def on_cancel():
-    ok = MANAGER.cancel()
-    return "Cancelling…" if ok else "Nothing is running."
+def on_cancel_job(selector: str):
+    job = _resolve_job(selector)
+    if job is None:
+        return "No job selected.", _jobs_rows()
+    was_running = job.running
+    ok = MANAGER.cancel(job.id)
+    if not ok:
+        return f"Job `{job.spec.short()}` is not queued or running.", _jobs_rows()
+    return (f"Cancelling `{job.spec.short()}`…" if was_running
+            else f"Removed `{job.spec.short()}` from the queue."), _jobs_rows()
+
+
+def on_cancel_all():
+    n = MANAGER.cancel_all()
+    return (f"Cancelling {n} job(s)." if n else "No queued or running jobs."), _jobs_rows()
+
+
+def on_clear_finished():
+    n = MANAGER.clear_finished()
+    return (f"Cleared {n} finished job(s)." if n else "No finished jobs to clear."), _jobs_rows()
+
+
+def on_slots(slots):
+    n = MANAGER.set_slots(int(slots or 1))
+    store.save_queue_slots(n)
+    return (f"Parallel renders: **{n}**. Keep parallel × TTS concurrency ≤ ~12 "
+            f"to avoid Edge rate limiting."), _jobs_rows()
+
+
+def on_job_select(evt: gr.SelectData):
+    global SELECTED_JOB
+    row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    jid = ""
+    row_value = getattr(evt, "row_value", None)
+    if row_value is not None:
+        try:
+            jid = str(row_value[0])
+        except (TypeError, IndexError, KeyError):
+            jid = ""
+    if not jid:
+        try:
+            jid = JOB_VIEW[int(row)]
+        except (TypeError, ValueError, IndexError):
+            jid = ""
+    job = MANAGER.get(jid) if jid else None
+    if job is None:
+        return gr.skip(), "Select a job row.", gr.skip(), gr.skip(), gr.skip(), gr.skip()
+    SELECTED_JOB = job.id
+    status, pct, log, audio, download = _job_view(job, force_audio=True)
+    return job.id, status, pct, log, audio, download
+
+
+def on_job_pick(selector: str):
+    global SELECTED_JOB
+    job = _resolve_job(selector)
+    if job is None:
+        return gr.skip(), "No job matches that id or number.", gr.skip(), gr.skip(), gr.skip(), gr.skip()
+    SELECTED_JOB = job.id
+    status, pct, log, audio, download = _job_view(job, force_audio=True)
+    return job.id, status, pct, log, audio, download
 
 
 def on_tick():
-    snap = MANAGER.snapshot()
-    if not snap:
-        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
-
-    pct = snap["percent"]
-    status = []
-    if snap["running"]:
-        status.append(f"**Running** · {snap['kind']} · {snap['elapsed']:.0f}s")
-    elif snap["done"] and snap.get("cancelled"):
-        status.append(f"**Cancelled** · {snap['elapsed']:.0f}s — finished chunks are kept")
-    elif snap["done"]:
-        status.append(f"**Finished** (exit {snap['returncode']}) · {snap['elapsed']:.0f}s")
-    else:
-        status.append("Idle")
-    if snap["chapter_total"]:
-        status.append(f"Chapter {snap['chapter_index']}/{snap['chapter_total']}: "
-                      f"{snap['chapter_title']}")
-        status.append(f"Chunk {snap['chunk_done']}/{snap['chunk_total']}")
-    if snap["stalled"]:
-        status.append("⚠ **No output for 5+ minutes** — the TTS request may be stuck. "
-                      "Cancel and re-run: finished chunks are kept.")
-    if snap["error"] and not snap.get("cancelled"):
-        status.append(f"❌ `{snap['error']}`")
-
-    audio = gr.skip()
-    download = gr.skip()
-    if snap["done"]:
-        outs = [str(p) for p in store.list_outputs(S["ws"])]
-        if outs:
-            latest = outs[0]
-            if S.get("audio") != latest:
-                S["audio"] = latest
-                audio = latest
-                download = outs if len(outs) > 1 else latest
-            if MANAGER.current and not MANAGER.current.consumed:
-                status.append(f"Output: `{outs[0]}`" +
-                              (f" (+{len(outs) - 1} more)" if len(outs) > 1 else ""))
-        if MANAGER.current:
-            MANAGER.current.consumed = True
-    log = snap["log"][-20000:]
-    return "\n\n".join(status), pct, log, audio, download
+    global SELECTED_JOB
+    MANAGER.pump()
+    rows = _jobs_rows()
+    job = _selected_job()
+    if job is None:
+        msg = "Idle — queue empty."
+        if S.get("ws"):
+            pid = store.external_render_pid(S["ws"] / "work")
+            if pid:
+                msg += (f"\n\n⚠ An external render (PID {pid}) is writing this book's "
+                        f"workspace. It was started outside this queue; wait for it to "
+                        f"finish before rendering this book here.")
+        return rows, msg, 0.0, "", gr.skip(), gr.skip()
+    SELECTED_JOB = job.id
+    status, pct, log, audio, download = _job_view(job)
+    return rows, status, pct, log, audio, download
 
 
 # --------------------------------------------------------------------------
@@ -672,7 +881,12 @@ def build_param_widget(p: pspec.Param):
             value = "auto"
         return gr.Dropdown(label=p.label, choices=choices, value=value, info=p.help)
     if p.kind == "int":
-        return gr.Number(label=p.label, value=p.default, precision=0, info=p.help)
+        extra = {}
+        if p.minimum is not None:
+            extra["minimum"] = p.minimum
+        if p.maximum is not None:
+            extra["maximum"] = p.maximum
+        return gr.Number(label=p.label, value=p.default, precision=0, info=p.help, **extra)
     if p.kind == "float":
         return gr.Number(label=p.label, value=p.default, precision=2, info=p.help,
                          minimum=p.minimum, maximum=p.maximum, step=p.step)
@@ -788,9 +1002,24 @@ with gr.Blocks(title="Book to Audio") as demo:
         # -------------------------------------------------------------- Run
         with gr.Tab("Run"):
             with gr.Row():
-                render_btn = gr.Button("Render", variant="primary", scale=2)
-                cancel_btn = gr.Button("Cancel", variant="stop", scale=1)
-            run_status = gr.Markdown("Idle")
+                render_btn = gr.Button("Add to queue", variant="primary", scale=2)
+                cancel_btn = gr.Button("Cancel selected", variant="stop", scale=1)
+                cancel_all_btn = gr.Button("Cancel all", scale=1)
+                clear_btn = gr.Button("Clear finished", scale=1)
+            with gr.Row():
+                slots_dd = gr.Dropdown(label="Parallel renders", choices=[1, 2, 3],
+                                       value=store.queue_slots(), scale=1,
+                                       info="Each job uses Parameters → TTS concurrency.")
+                job_pick = gr.Textbox(label="Select job (id or #)", scale=2,
+                                      placeholder="e.g. 3f2a9c or 1")
+                select_btn = gr.Button("Show", scale=1)
+            jobs_table = gr.Dataframe(
+                headers=["id", "book", "chapters", "state", "%", "elapsed", "output"],
+                datatype=["str", "str", "str", "str", "number", "str", "str"],
+                interactive=False, wrap=True, max_height=220)
+            gr.Markdown("_Keep **parallel renders × TTS concurrency** at about 12 or less — "
+                        "Edge TTS rate-limits aggressive request counts._")
+            run_status = gr.Markdown("Idle — queue empty.")
             progress = gr.Slider(0, 100, value=0, label="Progress", interactive=False)
             log_box = gr.Textbox(label="Log", lines=14, max_lines=14, autoscroll=True)
             with gr.Row():
@@ -840,12 +1069,26 @@ with gr.Blocks(title="Book to Audio") as demo:
     q_assign.click(on_assign, inputs=[q_seg, q_speaker, q_chapter, q_only],
                    outputs=[q_table, q_status])
 
-    render_btn.click(on_render, inputs=PARAM_INPUTS + [extra_args, chapter_pick],
-                     outputs=[run_status, progress, log_box])
-    cancel_btn.click(on_cancel, outputs=[run_status])
+    render_btn.click(on_enqueue, inputs=PARAM_INPUTS + [extra_args, chapter_pick],
+                     outputs=[run_status, jobs_table, progress, log_box])
+    cancel_btn.click(on_cancel_job, inputs=[job_pick],
+                     outputs=[run_status, jobs_table])
+    cancel_all_btn.click(on_cancel_all, outputs=[run_status, jobs_table])
+    clear_btn.click(on_clear_finished, outputs=[run_status, jobs_table])
+    slots_dd.change(on_slots, inputs=[slots_dd], outputs=[run_status, jobs_table])
+    jobs_table.select(on_job_select,
+                      outputs=[job_pick, run_status, progress, log_box,
+                               audio_out, download_out])
+    select_btn.click(on_job_pick, inputs=[job_pick],
+                     outputs=[job_pick, run_status, progress, log_box,
+                              audio_out, download_out])
+    job_pick.submit(on_job_pick, inputs=[job_pick],
+                    outputs=[job_pick, run_status, progress, log_box,
+                             audio_out, download_out])
 
     timer = gr.Timer(1.0, active=True)
-    timer.tick(on_tick, outputs=[run_status, progress, log_box, audio_out, download_out])
+    timer.tick(on_tick, outputs=[jobs_table, run_status, progress, log_box,
+                                 audio_out, download_out])
 
     # keep the "merge into" dropdown in sync with the cast table
     def _refresh_merge(rows):
