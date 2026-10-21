@@ -70,8 +70,9 @@ def main():
     parser.add_argument("--chapters", help="Only synthesize specified chapters (e.g., '1,3,5-8').")
     parser.add_argument("--list-chapters", action="store_true",
                         help="Print chapter numbers/titles and exit.")
-    parser.add_argument("--concurrency", type=int, default=4,
-                        help="Parallel edge-tts request concurrency (default: 4).")
+    parser.add_argument("--concurrency", type=int, default=6,
+                        help="Parallel edge-tts request concurrency (default: 6; "
+                             "8-10 is often faster, watch for HTTP 403 rate limits).")
     parser.add_argument("--on-chunk-failure", choices=["stop", "skip"], default="stop",
                         help="Action when a chunk fails retries: 'stop' or 'skip'.")
     parser.add_argument("--list-voices", action="store_true", help="List available edge-tts voices and exit.")

@@ -1,5 +1,4 @@
 import concurrent.futures
-import random
 import re
 import shutil
 import sys
@@ -7,7 +6,8 @@ import time
 from pathlib import Path
 from typing import Callable, List
 
-from .audio import concat_audio, is_valid_audio, make_silence, trim_silence_edges
+from .audio import (audio_file_ok, concat_audio, is_valid_audio, make_silence,
+                    trim_silence_edges)
 from .cast import format_report
 from .cast_dispatcher import generate_cast, resolve_cast_file
 from .extract import chunk_chapter, extract_epub, extract_pdf
@@ -255,7 +255,7 @@ def run(args):
 
         for c_idx, (kind, chunk_str, seg_idx) in enumerate(segments):
             out_chunk = store.chunk_path(idx, c_idx, suffix=chunk_suffix)
-            if store.is_chunk_done(idx, c_idx) and out_chunk.exists() and is_valid_audio(out_chunk):
+            if store.is_chunk_done(idx, c_idx) and audio_file_ok(out_chunk):
                 chunk_paths[c_idx] = out_chunk
                 continue
 

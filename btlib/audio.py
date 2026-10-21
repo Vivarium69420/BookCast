@@ -12,12 +12,25 @@ from typing import List
 
 
 def is_valid_audio(path: Path) -> bool:
-    """Tests if an audio file can be fully decoded without errors."""
+    """Tests if an audio file can be fully decoded without errors.
+
+    This spawns ffmpeg and decodes the whole file (~60 ms per chunk), so
+    resume checks use ``audio_file_ok`` instead: progress.json only marks a
+    chunk done after it has passed this test.
+    """
     if not path.exists() or path.stat().st_size == 0:
         return False
     cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-f", "null", "-"]
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0 and not result.stderr.strip()
+
+
+def audio_file_ok(path: Path, min_bytes: int = 1024) -> bool:
+    """Cheap resume check: the chunk was validated before being marked done."""
+    try:
+        return path.is_file() and path.stat().st_size >= min_bytes
+    except OSError:
+        return False
 
 
 def trim_silence_edges(path: Path, threshold_db: int = -40):
