@@ -160,8 +160,10 @@ are stricter: they raise instead of silently labelling scene numbers as "LLM".
 **Status:** the engine and harness are implemented, but no real model run has
 been recorded in this repo yet (the development machine has no GPU/Ollama). Do
 not treat the LLM path as an accuracy win until the optional Colab PDNC cell
-shows it clears the scene baseline (target: +3 points attribution, gender ≥
-0.95, no character-precision regression).
+shows it clears the scene baseline. On the notebook's six-book subset, the
+current scene baseline is **0.571 attr(given) / 0.547 e2e, gender 0.938,
+charP 0.944**; the gate is **+3 points attribution, gender ≥ 0.95, no charP
+regression**.
 
 The precision work (v8) rejects three classes of rubbish before they earn a
 voice — bare honorifics (`Mr` with no surname), non-persons (places, demonyms,
