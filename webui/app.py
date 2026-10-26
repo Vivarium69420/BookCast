@@ -15,6 +15,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -42,6 +43,7 @@ SERVER_HOST = "127.0.0.1"
 SELECTED_JOB: Optional[str] = None
 JOB_VIEW: List[str] = []
 LAST_AUDIO: Optional[tuple] = None
+_ANALYZE_SYNC_LOCK = threading.Lock()
 
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 OPEN_ORDER: List[str] = []
@@ -94,6 +96,9 @@ def _blank_session() -> Dict[str, Any]:
         "pending_params": None,
         "pending_extra": "",
         "pending_cast": None,
+        "analyze_job": None,
+        "last_analyzed_job": None,
+        "analyze_prev_chapters": set(),
     }
 
 
@@ -106,6 +111,10 @@ def _activate(slug: Optional[str]) -> None:
         S = SESSIONS[slug]
         S["pending_cast"] = None
         ACTIVE_SLUG = slug
+        job = _book_job(S)
+        if job is not None and job.spec.kind == "analyze" and not job.done:
+            S["analyze_job"] = job.id
+        _poll_analyze_job(S)
     else:
         S = _blank_session()
         ACTIVE_SLUG = None
@@ -184,6 +193,9 @@ def _load_session(path: Path, book=None) -> Dict[str, Any]:
         "last_job": meta.get("last_job"),
     })
     session["needs_rerender"] = _settings_differ(session)
+    job = _book_job(session)
+    if job is not None and job.spec.kind == "analyze" and not job.done:
+        session["analyze_job"] = job.id
     SESSIONS[slug] = session
     if slug not in OPEN_ORDER:
         OPEN_ORDER.append(slug)
@@ -399,6 +411,11 @@ def _quote_labels(book, cast) -> List[str]:
 
 def _cast_note(session: Optional[Dict[str, Any]] = None) -> str:
     session = session or S
+    job_id = session.get("analyze_job")
+    job = MANAGER.get(job_id) if job_id else None
+    if job is not None and not job.done:
+        return (f"**Analysis {job.state}** as job `{job.spec.short()}` — "
+                f"watch Activity. The table shows the previous cast until it finishes.")
     cast = session.get("cast")
     if cast:
         return (f"Loaded saved cast ({len(cast.get('characters', []))} characters) · "
@@ -409,6 +426,79 @@ def _cast_note(session: Optional[Dict[str, Any]] = None) -> str:
 # --------------------------------------------------------------------------
 # analysis / cast helpers
 # --------------------------------------------------------------------------
+
+def _cast_chapters(data: Optional[Dict[str, Any]]) -> set:
+    return {int(k) for k in (data or {}).get("attribution") or {}
+            if str(k).isdigit()}
+
+
+def _poll_analyze_job(session: Optional[Dict[str, Any]] = None) -> tuple:
+    """Import a finished background analysis into the session.
+
+    Returns ``(cast_changed, status_message)``.  The cast is read from disk only
+    after the job exits, so the UI never sees a partially written JSON file.
+    """
+    session = session or S
+    job_id = session.get("analyze_job")
+    if not job_id:
+        return False, ""
+    job = MANAGER.get(job_id)
+    if job is None:
+        session["analyze_job"] = None
+        return False, ""
+    if not job.done:
+        return False, ""
+
+    with _ANALYZE_SYNC_LOCK:
+        # Re-check under the lock: the timer and book switching can race.
+        if session.get("analyze_job") != job_id:
+            return False, ""
+        session["analyze_job"] = None
+        if job.cancelled:
+            session["last_analyzed_job"] = job.id
+            return False, (f"**Analysis cancelled** · job `{job.spec.short()}`. "
+                           f"Use **Continue selected job** to re-run it.")
+        if job.returncode != 0:
+            session["last_analyzed_job"] = job.id
+            return False, (f"**Analysis failed** · job `{job.spec.short()}`: "
+                           f"`{job.error or f'exit code {job.returncode}'}`. "
+                           f"See the Activity log.")
+        data = castlib.load(session["ws"])
+        if not data:
+            session["last_analyzed_job"] = job.id
+            return False, ("**Analysis finished, but no cast file was found.** "
+                           "See the Activity log.")
+        ok, problems, _summary = castlib.validate_import(
+            data, session.get("book"), session.get("cast"))
+        if not ok:
+            # Never leave an invalid cast on disk for a later render to pick up.
+            target = store.cast_path(session["ws"])
+            bak = target.with_suffix(".json.bak")
+            try:
+                if bak.exists():
+                    target.write_text(bak.read_text(encoding="utf-8"), encoding="utf-8")
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            session["last_analyzed_job"] = job.id
+            detail = "; ".join(problems[:3])
+            return False, (f"**Analysis produced an invalid cast:** `{detail}`. "
+                           f"See the Activity log.")
+
+        old = session.get("analyze_prev_chapters") or set()
+        new = _cast_chapters(data)
+        redone = store.invalidate_chapters(session["ws"], old | new)
+        session["cast"] = data
+        session["analyze_prev_chapters"] = set()
+        session["last_analyzed_job"] = job.id
+        session["dirty"].clear()
+        msg = (f"**Analysis complete** · {castlib.source_label(data)}. "
+               f"Review the cast below.")
+        if redone:
+            msg += f" {len(redone)} chapter(s) will re-render."
+        return True, msg
+
 
 def _run_sync(argv: List[str], timeout: int = 900) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -447,13 +537,66 @@ def _analyze_now(values: Dict[str, Any], extra: str = "") -> tuple:
         return False, "Analysis finished but no cast file was found:\n" + out[-1500:]
     data = json.loads(cast_file.read_text(encoding="utf-8"))
     target = store.cast_path(S["ws"])
+    old = _cast_chapters(S.get("cast"))
     if target.exists():
         target.with_suffix(".json.bak").write_text(
             target.read_text(encoding="utf-8"), encoding="utf-8")
     target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    redone = store.invalidate_chapters(S["ws"], old | _cast_chapters(data))
     S["cast"] = data
     S["dirty"].clear()
-    return True, f"Cast saved to {target}"
+    S["analyze_job"] = None
+    S["analyze_prev_chapters"] = set()
+    note = f" {len(redone)} chapter(s) will re-render." if redone else ""
+    return True, f"Cast saved to {target}{note}"
+
+
+def _queue_analysis(values: Dict[str, Any], extra: str = "") -> tuple:
+    """Start a long-running (light/heavy) cast analysis in the background."""
+    global SELECTED_JOB
+    if not S["path"] or not S["ws"] or not S["book"]:
+        return False, "Load a book first."
+    busy = _busy_reason()
+    if busy:
+        return False, f"Cannot analyze: {busy}."
+
+    target = store.cast_path(S["ws"])
+    if target.exists():
+        try:
+            target.with_suffix(".json.bak").write_text(
+                target.read_text(encoding="utf-8"), encoding="utf-8")
+        except OSError:
+            pass
+    S["analyze_prev_chapters"] = _cast_chapters(S.get("cast"))
+    S["analyze_job"] = None
+    S["last_analyzed_job"] = None
+
+    workdir = S["ws"] / "work"
+    argv = [str(S["path"]), "--analyze-only"]
+    argv += pspec.build_argv(values, extra=extra)
+    argv += ["--cast-out", str(target), "--workdir", str(workdir)]
+    job_spec = JobSpec(
+        book=S["path"], title=f"Analyze · {S['book'].title}",
+        cast_file=target, workdir=workdir, out_path=target,
+        args=argv, chapters="", kind="analyze",
+    )
+    try:
+        job = MANAGER.enqueue(job_spec, cwd=ROOT,
+                              log_path=store.job_log_path(S["ws"], job_spec.id))
+    except Exception as exc:
+        return False, f"Could not queue analysis: {exc}"
+
+    store.save_meta(
+        S["ws"], last_job=job.id, params=S.get("params"),
+        extra=S.get("extra", ""), chapter_range=S.get("chapter_range", "all"),
+    )
+    S["analyze_job"] = job.id
+    S["last_job"] = job.id
+    SELECTED_JOB = job.id
+    position = MANAGER.position(job.id)
+    where = f"queued at position {position}" if position else "started"
+    return True, (f"Analysis {where} as job `{job.spec.short()}`. "
+                  f"Track it in **Activity**; the cast updates when it finishes.")
 
 
 def _reload_cast(data: Dict[str, Any]):
@@ -497,11 +640,22 @@ def _busy_reason() -> str:
     if not ws:
         return ""
     job = MANAGER.running_for(ws / "work")
+    if job is None:
+        # A queued analysis will overwrite cast.json when it starts, so block
+        # edits even before it gets a slot.  Queued renders only read the cast.
+        target = (ws / "work").resolve()
+        job = next((j for j in MANAGER.jobs
+                    if j.state == "queued" and j.spec.kind == "analyze"
+                    and Path(j.spec.workdir).resolve() == target), None)
     if job:
-        return f"job `{job.spec.short()}` is rendering this book"
+        if job.spec.kind == "analyze":
+            action = "queued to analyze" if job.state == "queued" else "analyzing"
+        else:
+            action = "rendering"
+        return f"job `{job.spec.short()}` is {action} this book"
     pid = store.external_render_pid(ws / "work")
     if pid:
-        return f"another process (PID {pid}) is rendering this book"
+        return f"another process (PID {pid}) is working on this book"
     return ""
 
 
@@ -594,8 +748,10 @@ def _queue_summary() -> str:
 def _job_status(job) -> str:
     snap = job.snapshot()
     state = snap["state"]
+    analyze = job.spec.kind == "analyze"
+    scope = "text-only analysis" if analyze else f"chapters {job.spec.chapters or 'all'}"
     lines = [f"### {job.spec.title}",
-             f"Job `{job.spec.short()}` · chapters {job.spec.chapters or 'all'}"]
+             f"Job `{job.spec.short()}` · {scope}"]
     if state == "queued":
         pos = MANAGER.position(job.id)
         lines.append(f"**Queued** · position {pos} · waiting {snap['queued_for']:.0f}s")
@@ -604,28 +760,41 @@ def _job_status(job) -> str:
     elif state == "stalled":
         lines.append(f"**Stalled** · no output for 5+ minutes · {snap['elapsed']:.0f}s")
     elif state == "cancelled":
-        lines.append(f"**Cancelled** · {snap['elapsed']:.0f}s — finished chunks are kept. "
-                     f"Click **Continue selected job** to resume.")
+        lines.append(f"**Cancelled** · {snap['elapsed']:.0f}s — "
+                     + ("click **Continue selected job** to re-run the analysis."
+                        if analyze else
+                        "finished chunks are kept. Click **Continue selected job** to resume."))
     elif state == "done":
         lines.append(f"**Finished** (exit {snap['returncode']}) · {snap['elapsed']:.0f}s")
     else:
         lines.append(f"**Failed** (exit {snap['returncode']}) · {snap['elapsed']:.0f}s — "
-                     f"finished chunks are kept. Click **Continue selected job** to resume.")
+                     + ("click **Continue selected job** to re-run the analysis."
+                        if analyze else
+                        "finished chunks are kept. Click **Continue selected job** to resume."))
 
     if snap["chapter_total"]:
-        lines.append(f"Chapter {snap['chapter_index']}/{snap['chapter_total']}: "
+        unit = "Step" if analyze else "Chapter"
+        lines.append(f"{unit} {snap['chapter_index']}/{snap['chapter_total']}: "
                      f"{snap['chapter_title']}")
-        lines.append(f"Chunk {snap['chunk_done']}/{snap['chunk_total']}")
+        if not analyze:
+            lines.append(f"Chunk {snap['chunk_done']}/{snap['chunk_total']}")
     if state == "stalled":
-        lines.append("⚠ **No output for 5+ minutes** — the TTS request may be stuck. "
-                     "Cancel this job, then click **Continue selected job**; finished "
-                     "chunks are kept.")
+        if analyze:
+            lines.append("⚠ **No output for 15+ minutes** — the model request may be "
+                         "stuck. Cancel this job, then click **Continue selected job** "
+                         "to re-run the analysis.")
+        else:
+            lines.append("⚠ **No output for 5+ minutes** — the TTS request may be stuck. "
+                         "Cancel this job, then click **Continue selected job**; finished "
+                         "chunks are kept.")
     if snap["error"] and not snap.get("cancelled"):
         lines.append(f"❌ `{snap['error']}`")
     outs = store.job_outputs(job.spec) if job.done else []
     if outs:
         lines.append(f"Output: `{outs[0]}`" +
                      (f" (+{len(outs) - 1} more)" if len(outs) > 1 else ""))
+    elif analyze and job.done and job.returncode == 0:
+        lines.append(f"Cast: `{job.spec.out_path}`")
     lines.append(f"Queue: {_queue_summary()}")
     return "\n\n".join(lines)
 
@@ -660,20 +829,26 @@ def _book_run_md(session: Optional[Dict[str, Any]] = None) -> str:
     if job:
         snap = job.snapshot()
         state = snap["state"]
-        head = f"**{state.title()}** · job `{job.spec.short()}`"
+        analyze = job.spec.kind == "analyze"
+        head = (f"**{state.title()}** · "
+                f"{'analysis' if analyze else 'job'} `{job.spec.short()}`")
         if state == "queued":
             head += f" · position {MANAGER.position(job.id)}"
         if snap["chapter_total"]:
-            head += (f" · chapter {snap['chapter_index']}/{snap['chapter_total']}"
+            unit = "step" if analyze else "chapter"
+            head += (f" · {unit} {snap['chapter_index']}/{snap['chapter_total']}"
                      f" · {snap['percent']:.0f}%")
         if snap["chunk_total"]:
             head += f" · chunks {snap['chunk_done']}/{snap['chunk_total']}"
         if state in ("cancelled", "error"):
             head += " — use **Continue selected job** in Activity."
         if state == "done":
-            outs = store.job_outputs(job.spec)
-            if outs:
-                head += f" · `{outs[0]}`"
+            if analyze:
+                head += " · cast ready to review in **Cast & quotes**"
+            else:
+                outs = store.job_outputs(job.spec)
+                if outs:
+                    head += f" · `{outs[0]}`"
         return head
     if session.get("ws"):
         pid = store.external_render_pid(session["ws"] / "work")
@@ -897,7 +1072,8 @@ def on_close_book():
         _activate(None)
     msg = "Closed the tab."
     if running and running.running:
-        msg += " The render continues in Activity."
+        action = "analysis" if running.spec.kind == "analyze" else "render"
+        msg += f" The {action} continues in Activity."
         # Keep the running job selected so it stays visible.
         global SELECTED_JOB
         SELECTED_JOB = running.id
@@ -912,6 +1088,14 @@ def on_analyze():
         return (gr.update(), gr.update(), gr.update(), gr.update(),
                 f"**Cannot analyze: {busy}.**", _book_run_md())
     values = _effective_values(S)
+    if values.get("attribution_mode") in ("light", "heavy"):
+        ok, msg = _queue_analysis(values, S.get("extra", ""))
+        if not ok:
+            return (gr.update(), gr.update(), gr.update(), gr.update(),
+                    f"**{msg}**", _book_run_md())
+        return (gr.update(), _cast_note(), gr.update(), gr.update(),
+                f"**{msg}**", _book_run_md())
+
     ok, msg = _analyze_now(values, S.get("extra", ""))
     if not ok or not S["cast"]:
         return (gr.update(), gr.update(), gr.update(), gr.update(),
@@ -1359,6 +1543,7 @@ def _set_flag(args: List[str], flag: str, value: Any) -> List[str]:
 
 def on_render(chapter_range: str, start_over: bool, confirm_restart: bool):
     global SELECTED_JOB
+    _poll_analyze_job()
     rows = _jobs_rows()
     book_md = _book_run_md()
     if not S.get("path") or not S.get("ws") or not S.get("book"):
@@ -1404,6 +1589,13 @@ def on_render(chapter_range: str, start_over: bool, confirm_restart: bool):
         values["fresh"] = True
 
     if not store.cast_path(S["ws"]).exists():
+        if values.get("attribution_mode") in ("light", "heavy"):
+            return ("**No cast yet.** Click **Analyze cast** first; light/heavy "
+                    "analysis runs in Activity and can take longer than the old "
+                    "synchronous timeout. Render again when the cast is ready.",
+                    rows, 0.0, "", book_md, _range_summary(), "Analyze first.",
+                    _render_warning(), gr.update(visible=needs_restart),
+                    gr.update(value=False))
         ok, msg = _analyze_now(values, S.get("extra", ""))
         if not ok:
             return (f"**{msg}**", rows, 0.0, msg, book_md,
@@ -1474,11 +1666,12 @@ def on_continue_job(selector: str):
                 f"or cancel it first."), rows, 0.0, "", book_md
 
     spec = job.spec
+    analyze = spec.kind == "analyze"
     if not spec.workdir.exists():
         return (f"No saved work folder for `{spec.short()}`. Use "
                 f"**Render / continue current book** to start from scratch."), \
             rows, 0.0, "", book_md
-    if not spec.cast_file.exists():
+    if not analyze and not spec.cast_file.exists():
         return (f"Cast file for `{spec.short()}` is missing: `{spec.cast_file}`."), \
             rows, 0.0, "", book_md
     if not spec.book.exists():
@@ -1503,6 +1696,7 @@ def on_continue_job(selector: str):
         book=spec.book, title=spec.title, cast_file=spec.cast_file,
         workdir=spec.workdir, out_path=spec.out_path, args=args,
         chapters=spec.chapters, per_chapter=spec.per_chapter,
+        kind=spec.kind,
     )
     if spec.per_chapter:
         Path(spec.out_path).mkdir(parents=True, exist_ok=True)
@@ -1514,10 +1708,20 @@ def on_continue_job(selector: str):
     except Exception as exc:
         return f"**Could not continue:** `{exc}`", rows, 0.0, "", book_md
     SELECTED_JOB = new_job.id
-    if S.get("ws") and Path(S["ws"]).resolve() == Path(ws).resolve():
-        S["last_job"] = new_job.id
+    owner = next((session for session in SESSIONS.values()
+                  if session.get("ws")
+                  and Path(session["ws"]).resolve() == Path(ws).resolve()), None)
+    if owner is not None:
+        owner["last_job"] = new_job.id
+        if analyze:
+            owner["analyze_job"] = new_job.id
+            owner["analyze_prev_chapters"] = _cast_chapters(owner.get("cast"))
     rows = _jobs_rows()
     state = "Queued" if new_job.state == "queued" else "Started"
+    if analyze:
+        return (f"**{state}** `{new_spec.short()}` — re-running analysis "
+                f"`{spec.short()}` · cast `{spec.out_path}`"), \
+            rows, 0.0, "", _book_run_md()
     return (f"**{state}** `{new_spec.short()}` — continuing `{spec.short()}` "
             f"from saved chunks · output `{spec.out_path}`"), \
         rows, 0.0, "", _book_run_md()
@@ -1535,6 +1739,10 @@ def on_cancel_job(selector: str):
         return (f"Job `{job.spec.short()}` is not queued or running.",
                 _jobs_rows(), _book_run_md())
     if was_running:
+        if job.spec.kind == "analyze":
+            return (f"Cancelling `{job.spec.short()}`… The previous cast is kept. "
+                    f"Click **Continue selected job** to re-run the analysis."), \
+                _jobs_rows(), _book_run_md()
         return (f"Cancelling `{job.spec.short()}`… Saved chunks are kept — "
                 f"click **Continue selected job** to resume."), \
             _jobs_rows(), _book_run_md()
@@ -1767,8 +1975,19 @@ def on_job_pick(selector: str):
 def on_tick():
     global SELECTED_JOB
     MANAGER.pump()
+    cast_changed, cast_msg = _poll_analyze_job(S)
     rows = _jobs_rows()
     book_md = _book_run_md()
+    if cast_changed:
+        cast_rows, cast_speakers, cast_qs = _reload_cast(S["cast"])
+        cast_note = _cast_note()
+    else:
+        cast_rows = cast_speakers = cast_qs = gr.skip()
+        # Keep "Analysis queued/running…" current, and replace it when the job
+        # failed or was cancelled (no cast change in either case).
+        cast_note = _cast_note() if (cast_msg or S.get("analyze_job")) else gr.skip()
+    book_status = cast_msg if cast_msg else gr.skip()
+    cast_outputs = (book_status, cast_rows, cast_note, cast_qs, cast_speakers)
     job = _selected_job()
     if job is None:
         msg = "Idle — queue empty."
@@ -1778,10 +1997,10 @@ def on_tick():
                 msg += (f"\n\n⚠ An external render (PID {pid}) is writing this book's "
                         f"workspace. It was started outside this queue; wait for it to "
                         f"finish before rendering this book here.")
-        return rows, msg, 0.0, "", gr.skip(), gr.skip(), book_md
+        return (rows, msg, 0.0, "", gr.skip(), gr.skip(), book_md, *cast_outputs)
     SELECTED_JOB = job.id
     status, pct, log, audio, download = _job_view(job)
-    return rows, status, pct, log, audio, download, book_md
+    return (rows, status, pct, log, audio, download, book_md, *cast_outputs)
 
 
 # --------------------------------------------------------------------------
@@ -1870,10 +2089,12 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                     analyze_btn = gr.Button("Analyze cast (no TTS)", variant="secondary",
                                             scale=2)
                 gr.Markdown(
-                    "_High accuracy: run `analyze_only_heavy` in the Colab notebook "
-                    "(or a local Ollama), then import the cast JSON in **Cast & quotes**. "
-                    "`Analyze cast` here uses whatever engine is selected; with `heavy` it "
-                    "needs `llm_endpoint` to be reachable._")
+                    "_High accuracy: start Ollama in the Colab notebook with the "
+                    "cloudflared tunnel, paste its `/api/generate` URL into **LLM "
+                    "endpoint**, choose `heavy`, then press **Analyze cast**. The "
+                    "analysis runs in **Activity** (no 15-minute timeout) and the cast "
+                    "updates here when it finishes. You can also import a Colab cast "
+                    "JSON in **Cast & quotes**._")
                 book_status = gr.Markdown("")
 
             with gr.Accordion("Parameters", open=False):
@@ -2168,7 +2389,8 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
 
     timer = gr.Timer(1.0, active=True)
     timer.tick(on_tick, outputs=[jobs_table, run_status, progress, log_box,
-                                 audio_out, download_out, book_run_md])
+                                 audio_out, download_out, book_run_md, book_status,
+                                 cast_table, cast_note, q_chapter, q_speaker])
 
     def _refresh_merge(rows):
         if not S["cast"]:

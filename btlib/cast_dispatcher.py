@@ -128,6 +128,7 @@ def _build_cast(book, args, mode: str) -> dict:
             cache_dir=getattr(args, "llm_cache_dir", None) or None,
             max_calls=int(max_calls) if max_calls else None,
             strict=bool(getattr(args, "analyze_only", False)),
+            progress=bool(getattr(args, "analyze_only", False)),
         )
 
     if mode == "light":

@@ -24,11 +24,15 @@ PYTHON = sys.executable
 
 CHAPTER_RE = re.compile(r"^\[(\d+)/(\d+)\]\s+(.*)$")
 CHUNK_RE = re.compile(r"chunk\s+(\d+)/(\d+)")
-CAST_SAVED_RE = re.compile(r"(?:Cast analysis saved to|Using cached cast analysis:)\s*(.+?)(?:\s+—.*)?$")
+CAST_SAVED_RE = re.compile(
+    r"(?:Cast saved to|Cast analysis saved to|Using cached cast analysis:)\s*(.+?)(?:\s+—.*)?$")
 DONE_RE = re.compile(r"Done\s*->\s*(.+)$")
-ERROR_RE = re.compile(r"(Traceback \(most recent call last\)|^Error|^error:|Killed by|Missing dependencies)")
+ERROR_RE = re.compile(
+    r"(Traceback \(most recent call last\)|^Error|^error:|^LLM analysis failed|"
+    r"Killed by|Missing dependencies)")
 
 STALL_SECONDS = 300
+ANALYZE_STALL_SECONDS = 900
 MAX_SLOTS = 3
 GLOBAL_IN_FLIGHT = 12          # slots x per-job concurrency should stay near this
 
@@ -44,6 +48,7 @@ class JobSpec:
     args: List[str]                 # CLI tokens, without python/script
     chapters: str = ""
     per_chapter: bool = False
+    kind: str = "render"            # "render" or "analyze"
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     created: float = field(default_factory=time.time)
 
@@ -92,8 +97,13 @@ class Job:
         return self.ended is not None
 
     @property
+    def is_analyze(self) -> bool:
+        return self.spec.kind == "analyze"
+
+    @property
     def stalled(self) -> bool:
-        return self.running and (time.time() - self.last_output) > STALL_SECONDS
+        limit = ANALYZE_STALL_SECONDS if self.is_analyze else STALL_SECONDS
+        return self.running and (time.time() - self.last_output) > limit
 
     @property
     def state(self) -> str:
@@ -152,6 +162,7 @@ class Job:
             "elapsed": self.elapsed(),
             "queued_for": (self.started or time.time()) - self.created,
             "per_chapter": self.spec.per_chapter,
+            "kind": self.spec.kind,
         }
 
 

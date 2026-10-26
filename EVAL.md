@@ -145,7 +145,11 @@ OpenAI-compatible) model for two narrow jobs:
    overridden.
 
 Run it on Colab (free T4) with the notebook's `analyze_only_heavy` mode or the
-optional PDNC cell; on a local machine with Ollama:
+optional PDNC cell. To drive the **local UI** from Colab without downloading a
+cast, set `EXPOSE_OLLAMA = True`, run notebook step **4b**, and paste its
+`https://….trycloudflare.com/api/generate` URL into the UI's **LLM endpoint**.
+`Analyze cast` then runs as a background job in **Activity**. On a local machine
+with Ollama:
 
 ```bash
 python run_eval.py --corpus pdnc --engine heavy --books ARoomWithAView Emma \

@@ -83,7 +83,9 @@ PARAMS: List[Param] = [
     Param("llm_model", "LLM model", "text", "llama3.1:8b",
           "--llm-model", [], "Model tag for the 'heavy' engine (e.g. qwen3:14b).", "Attribution"),
     Param("llm_endpoint", "LLM endpoint", "text", "http://localhost:11434/api/generate",
-          "--llm-endpoint", [], "Ollama /api/generate, or an OpenAI-compatible /v1/chat/completions URL.",
+          "--llm-endpoint", [],
+          "Ollama /api/generate. For Colab, paste the cloudflared URL from the "
+          "notebook (https://….trycloudflare.com/api/generate).",
           "Attribution"),
     Param("llm_strategy", "LLM work", "choice", "weak", "--llm-strategy",
           ["cast", "weak", "all"],
@@ -126,7 +128,7 @@ _MODE_FLAGS = {
 }
 
 # Flags the UI owns and never exposes as free text.
-_RESERVED = {"--cast-file", "--workdir", "--chapters", "-o", "--output"}
+_RESERVED = {"--cast-file", "--cast-out", "--workdir", "--chapters", "-o", "--output"}
 
 
 def build_argv(values: Dict[str, Any], *, extra: str = "") -> List[str]:

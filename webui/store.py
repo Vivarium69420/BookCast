@@ -291,6 +291,9 @@ def release_job_lock(workdir: Path, job_id: str) -> None:
 
 
 def job_outputs(spec: Any) -> List[Path]:
+    # Analyze-only jobs write a cast JSON, not playable audio.
+    if getattr(spec, "kind", "render") == "analyze":
+        return []
     out = Path(spec.out_path)
     try:
         if getattr(spec, "per_chapter", False):

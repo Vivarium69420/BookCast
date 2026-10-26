@@ -558,13 +558,15 @@ def analyze_book_llm(
     client: Optional[LLMClient] = None,
     verbose: bool = True,
     strict: bool = False,
+    progress: bool = False,
 ) -> dict:
     """Run scene attribution, reconcile the cast, then adjudicate weak lines.
 
     ``strategy`` is ``"cast"`` (reconciliation only), ``"weak"`` (default), or
     ``"all"`` (every dialogue line; useful for an ablation).  On any LLM
     failure the scene result is kept, so a render never dies because a model
-    server is down.
+    server is down.  ``progress`` emits machine-readable ``[i/N]`` lines for
+    the web UI's background analysis job.
     """
     strategy = strategy if strategy in {"cast", "weak", "all"} else "weak"
     batch_size = max(1, int(batch_size or 8))
@@ -587,6 +589,8 @@ def analyze_book_llm(
     errors = 0
 
     # ---- 1. cast reconciliation -----------------------------------------
+    if progress and strategy == "cast":
+        print("[1/1] Reconciling the cast", file=sys.stderr)
     try:
         result = client.query_json(_cast_prompt(book, data))
         s = _apply_cast_updates(data, result, narrator_gender=narrator_gender)
@@ -613,9 +617,12 @@ def analyze_book_llm(
     total_targets = 0
     consecutive_errors = 0
     llm_down = False
+    chapter_total = len(book.chapters)
     for ch_idx, chapter in enumerate(book.chapters, start=1):
         if llm_down:
             break
+        if progress:
+            print(f"[{ch_idx}/{chapter_total}] {chapter.title}", file=sys.stderr)
         segments = split_dialogue_narration(chapter.text)
         entries = (data.get("attribution") or {}).get(str(ch_idx)) or []
         if not entries:
@@ -682,6 +689,8 @@ def analyze_book_llm(
             if llm_down:
                 break
 
+    if progress:
+        print(f"[{chapter_total}/{chapter_total}] Finalizing the cast", file=sys.stderr)
     _recount(data)
     data["llm"].update({
         "usage": client.usage.summary(),

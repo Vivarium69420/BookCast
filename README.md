@@ -62,7 +62,9 @@ Workflow (one page per open book, plus a shared Activity panel):
 1. **Open a book** – upload an EPUB/PDF or paste a path. Every opened book is added to the
    **Open books** rail; switching between books never stops their renders.
 2. **Book & chapters** – review the chapter table and type a printer-style range such as
-   `1-3, 6-8` (blank or `all` renders every chapter). **Analyze cast** runs without TTS.
+   `1-3, 6-8` (blank or `all` renders every chapter). **Analyze cast** runs without TTS;
+   `light`/`heavy` analysis runs as a background job in **Activity** so long Colab analyses
+   neither block the page nor hit the old synchronous timeout.
 3. **Parameters** – every CLI flag except the global runtime knobs, grouped. Edit, then
    **Apply changes**. Content changes show a review first and need **Confirm changes**; the next
    render then warns and asks for confirmation because it will discard saved chunks. **Revert**
@@ -91,14 +93,17 @@ The Activity panel runs a bounded queue instead of a single job:
 - **Parallel renders** (1–3) controls how many books render at once. Waiting jobs start
   automatically; you can open and edit other books while renders run.
 - Every job keeps its own log (`runs/<slug>/logs/<job-id>.log`), progress, and output.
+  Light/heavy cast analyses use the same queue as renders and write `cast.json`
+  instead of audio.
 - Select a row (or type its id / queue number) to show that job's status, log, audio, and download.
-- **Continue selected job** re-queues a cancelled or failed job with its original content settings,
-  resuming from its saved chunks, while using the **current** global runtime settings.
+- **Continue selected job** re-queues a cancelled or failed job with its original content settings;
+  renders resume from saved chunks, while analyses re-run. Both use the **current** global
+  runtime settings.
 - A book can only have one queued/running job. The UI also writes a PID lock in
   `runs/<slug>/work/.ui-job.json`, so two UI instances (or a UI restarted while a CLI render is
   still running) cannot write to the same workspace.
-- Cast/quote edits are blocked while that book is rendering. Queued jobs read the cast when they
-  start, so editing before then is fine.
+- Cast/quote edits are blocked while that book is rendering or analyzing. Queued jobs read the
+  cast when they start, so editing before then is fine.
 
 **Runtime settings vs content settings:** **TTS concurrency** and **On chunk failure** are global
 and safe to change without invalidating saved chunks; they are in Activity and apply to new and
@@ -215,14 +220,35 @@ Interrupted runs resume automatically. Use `--fresh` to start over.
 
 ### Colab: generate a cast, render locally
 
-The free T4 route is the recommended one for this CPU-only machine:
+The free T4 route is the recommended one for this CPU-only machine. There are two
+workflows; both keep rendering local.
+
+**A. Live remote Ollama (no cast import)**
 
 1. Put the EPUB in `MyDrive/book_to_audio/books/` and open `book_to_audio_colab.ipynb`.
-2. Run steps 1–5 with `MODE = "analyze_only_heavy"` and a model such as `qwen3:14b`.
+2. Set `MODE = "analyze_only_heavy"`, `LLM_MODEL = "qwen3:14b"`, and
+   `EXPOSE_OLLAMA = True`, then run steps 1–4b. Step **4b** prints a free
+   `https://….trycloudflare.com/api/generate` URL. **Skip step 5** in this workflow.
+3. In the local UI, set **Attribution engine → heavy**, paste that URL into
+   **LLM endpoint**, and use the same model tag. Press **Analyze cast**.
+   The analysis runs in **Activity** against the Colab GPU; the UI stays responsive
+   and there is no 15-minute subprocess timeout. When it finishes, review the cast
+   and render locally.
+4. Keep the Colab runtime and tunnel alive while the analysis runs. The response
+   cache defaults to the local `runs/llm_cache/`, so a dropped tunnel does not
+   throw away completed prompts. The tunnel URL is public and Ollama has no login;
+   stop it when done (`pkill -x cloudflared`).
+
+**B. Download the cast (offline after analysis)**
+
+1. Set `MODE = "analyze_only_heavy"` and run steps 1–5 with the tunnel disabled.
    This is text-only (no TTS) and writes `MyDrive/book_to_audio/casts/<book>.cast.json`.
-3. Download the small cast JSON, use **Cast & quotes → Import cast JSON** in the local UI,
+2. Download the small cast JSON, use **Cast & quotes → Import cast JSON** in the local UI,
    then **Validate import → Apply imported cast**.
-4. Render locally. The pipeline already receives the imported cast as `--cast-file`.
+3. Render locally. The pipeline already receives the imported cast as `--cast-file`.
+
+Apply/importing a new cast invalidates previously rendered audio for the affected
+chapters; the next render regenerates them with the new voices.
 
 The notebook also has an optional PDNC evaluation cell (six novels, text-only) so the
 LLM change is measured before it becomes trusted. The LLM engine is **not yet
