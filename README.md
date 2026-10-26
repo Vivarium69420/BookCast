@@ -76,12 +76,14 @@ Workflow (one page per open book, plus a shared Activity panel):
    be overridden. **Quotes** lists each dialogue line (optionally only uncertain ones) and lets
    you reassign it.
 5. **Render this book** – **Render / continue current book** starts the active book now (or waits
-   for a slot) and resumes from saved chunks automatically. **Start over** ignores saved chunks
-   for that run only.
+   for a slot) and resumes from saved chunks automatically. The output file is named after the input
+   EPUB/PDF filename (for example `My Book.epub` → `My Book.mp3`). **Start over** ignores saved
+   chunks for that run only.
 6. **Activity** – shared by every open book: **Parallel renders**, global **TTS concurrency** and
    **On chunk failure**, the jobs table, status/log/progress, audio/download, and
-   **Continue selected job** / **Cancel selected job** / **Cancel all jobs** / **Clear finished
-   jobs**.
+   **Continue selected job** / **Cancel selected job** / **Delete selected job** / **Cancel all
+   jobs** / **Clear finished jobs**. Deleting a job clears its Activity row and log; rendered audio
+   and cast files stay on disk.
 
 Open books are remembered in `runs/session.json`: refreshing the page or restarting the UI reopens
 the same books and the active one (up to five).
@@ -120,12 +122,12 @@ chunks are kept.
 Each book gets a workspace under `runs/<book-slug>/`:
 
 ```
-cast.json     editable cast (always passed to the CLI as --cast-file)
-work/         chunks + progress.json (--workdir); .ui-job.json lock while rendering
-out.mp3       combined output, or out/ with --per-chapter
-logs/         one log per queued job (<job-id>.log)
-meta.json     last parameters / last job
-preview/      audition clips
+cast.json           editable cast (always passed to the CLI as --cast-file)
+work/               chunks + progress.json (--workdir); .ui-job.json lock while rendering
+<EPUB filename>.mp3 combined output, or <EPUB filename>/ with --per-chapter
+logs/               one log per queued job (<job-id>.log)
+meta.json           last parameters / last job
+preview/            audition clips
 ```
 
 Edits that affect a chapter delete that chapter's cached chunks, so the next render redoes only what changed.
@@ -140,14 +142,15 @@ Global UI state lives next to the workspaces: `runs/runtime.json` (TTS concurren
 The **Share output** accordion in Activity acts on the selected job, or on the active book when no
 job is selected:
 
-- **Google Drive** runs `rclone copyto` to `<remote>:<folder>/<book title>.mp3` and remembers the
+- **Google Drive** runs `rclone copyto` to `<remote>:<folder>/<output filename>` and remembers the
   remote and folder in `runs/sharing.json`. Add a Google Drive remote once with `rclone config` (the
   field defaults to `gdrive`), then check it with `rclone lsd gdrive:`. Large files can take a while;
   the status line streams while the upload runs, so keep the tab open.
-- **Phone** builds `http://<host>:<port>/share/<slug>` and a QR code. The route serves the combined
-  `out.mp3`, falls back to a title-named MP3 from older runs, or serves a cached `out.zip` for
-  `--per-chapter` books. **Detect** fills in the best local address; edit **Base URL** to your
-  Tailscale `100.x` address to reach the phone away from home.
+- **Phone** builds `http://<host>:<port>/share/<slug>` and a QR code. The route serves the most recent
+  output, named after the input EPUB/PDF (for example `The Secret Garden.epub` →
+  `The Secret Garden.mp3`), or `<EPUB filename>.zip` for `--per-chapter` books. **Detect** fills in
+  the best local address; edit **Base URL** to your Tailscale `100.x` address to reach the phone
+  away from home.
 
 The phone must be able to reach the Gradio server, so start it on the LAN/Tailscale interface:
 

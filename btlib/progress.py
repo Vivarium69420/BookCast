@@ -113,12 +113,21 @@ class ProgressStore:
 
     def matches(self, input_path: Path, args) -> bool:
         """True if a saved progress file was produced by the same input file
-        and the same TTS/output parameters, so it's safe to resume from."""
+        and the same TTS settings, so it's safe to resume from.
+
+        The output path is ignored: it only decides where the final file is
+        written, not how cached chunks sound, so renaming the output (for
+        example to match the EPUB filename) must not discard finished audio.
+        """
         if not self.data:
             return False
+        saved = dict(self.data.get("params") or {})
+        current = _params_signature(args)
+        saved.pop("output", None)
+        current.pop("output", None)
         return (
             self.data.get("input") == _input_signature(input_path)
-            and self.data.get("params") == _params_signature(args)
+            and saved == current
         )
 
     # -- book reconstruction ------------------------------------------

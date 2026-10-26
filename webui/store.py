@@ -5,7 +5,8 @@ Layout::
     runs/<slug>/
         cast.json     editable cast (always passed to the CLI as --cast-file)
         work/         explicit --workdir (chunks + progress.json)
-        out.mp3       combined output (or out/ for --per-chapter)
+        <book>.mp3    combined output (or <book>/ for --per-chapter), named
+                      after the input EPUB/PDF filename
         log.txt       last run log
         meta.json     last parameters / timestamps
         preview/      audition clips
@@ -27,10 +28,21 @@ BOOKS = ROOT / "books"
 RUNS = ROOT / "runs"
 PRESETS = ROOT / "webui" / "presets"
 
+_UNSAFE_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+
 
 def slugify(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower()
     return (s or "book")[:60]
+
+
+def output_stem(book: Optional[Path | str]) -> str:
+    """Filesystem-safe output name derived from the input filename."""
+    if not book:
+        return "out"
+    stem = Path(book).stem
+    clean = re.sub(r"\s+", " ", _UNSAFE_NAME.sub(" ", stem)).strip(" .")
+    return clean or "book"
 
 
 def sha256(path: Path, limit: int = 0) -> str:
@@ -75,8 +87,12 @@ def cast_path(ws: Path) -> Path:
     return ws / "cast.json"
 
 
-def out_path(ws: Path, per_chapter: bool) -> Path:
-    return ws / "out" if per_chapter else ws / "out.mp3"
+def out_path(ws: Path, per_chapter: bool, book: Optional[Path | str] = None) -> Path:
+    """Output path for a book, named after its input filename."""
+    name = output_stem(book) if book else "out"
+    if per_chapter and name.lower() in {"work", "preview", "logs", "share"}:
+        name = f"{name} (audio)"
+    return ws / name if per_chapter else ws / f"{name}.mp3"
 
 
 def load_meta(ws: Path) -> Dict[str, Any]:
@@ -96,17 +112,76 @@ def save_meta(ws: Path, **kw) -> None:
     (ws / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
+def _inside_ws(ws: Path, path: Path) -> bool:
+    try:
+        target = path.resolve()
+        root = Path(ws).resolve()
+    except OSError:
+        return False
+    return target == root or root in target.parents
+
+
+def _meta_output(ws: Path) -> Optional[Path]:
+    """The output path recorded for the most recent render, if any."""
+    meta = load_meta(ws)
+    raw = meta.get("output")
+    if raw:
+        path = Path(str(raw)).expanduser()
+        if not path.is_absolute():
+            path = Path(ws) / path
+        if _inside_ws(ws, path):
+            return path
+    argv = [str(a) for a in meta.get("last_argv") or []]
+    for i, arg in enumerate(argv):
+        value = None
+        if arg in ("-o", "--output") and i + 1 < len(argv):
+            value = argv[i + 1]
+        elif arg.startswith("--output="):
+            value = arg.split("=", 1)[1]
+        if value:
+            path = Path(value).expanduser()
+            if _inside_ws(ws, path):
+                return path
+    return None
+
+
+def _meta_book_stem(ws: Path) -> str:
+    """Input filename stem from metadata, for legacy title-less outputs."""
+    meta = load_meta(ws)
+    raw = meta.get("input") or ""
+    if not raw:
+        argv = [str(a) for a in meta.get("last_argv") or []]
+        raw = argv[0] if argv else ""
+    return Path(raw).stem if raw else ""
+
+
+def _output_dirs(ws: Path) -> List[Path]:
+    """Per-chapter output directories in a workspace (old and current names)."""
+    ws = Path(ws)
+    candidates: List[Path] = [ws / "out", _meta_output(ws) or ws / "out"]
+    try:
+        candidates.extend(p for p in ws.iterdir() if p.is_dir())
+    except OSError:
+        pass
+    skip = {"work", "preview", "logs", "share"}
+    seen: List[Path] = []
+    for path in candidates:
+        if not path.is_dir() or path.name in skip or path.name.startswith("."):
+            continue
+        if path not in seen:
+            seen.append(path)
+    return seen
+
+
 def list_outputs(ws: Path) -> List[Path]:
     files: List[Path] = []
-    single = ws / "out.mp3"
+    # Legacy combined output first, then chapter files, then title-named MP3s.
+    single = Path(ws) / "out.mp3"
     if single.exists() and single.stat().st_size > 0:
         files.append(single)
-    outdir = ws / "out"
-    if outdir.is_dir():
+    for outdir in _output_dirs(ws):
         files.extend(sorted(p for p in outdir.glob("*.mp3") if p.stat().st_size > 0))
-    # Older/manual runs may have written a title-named file (e.g. "Book.mp3")
-    # instead of out.mp3; keep those visible too.
-    named = sorted((p for p in ws.glob("*.mp3")
+    named = sorted((p for p in Path(ws).glob("*.mp3")
                     if p.name != "out.mp3" and p.stat().st_size > 0),
                    key=lambda p: p.stat().st_mtime, reverse=True)
     files.extend(p for p in named if p not in files)
@@ -129,6 +204,7 @@ def invalidate_chapters(ws: Path, chapters: Iterable[int]) -> List[int]:
         return []
 
     done = []
+    outdirs = _output_dirs(ws)
     for ch in data.get("chapters", []):
         i = ch.get("index")
         if i not in idxs:
@@ -141,17 +217,19 @@ def invalidate_chapters(ws: Path, chapters: Iterable[int]) -> List[int]:
         shutil.rmtree(ws / "work" / "chunks" / f"ch_{i:04d}", ignore_errors=True)
         combined = ws / "work" / "chapters" / f"ch_{i:04d}_combined.mp3"
         combined.unlink(missing_ok=True)
-        outdir = ws / "out"
-        if outdir.is_dir():
-            for p in outdir.glob(f"*{i:02d}*.mp3"):
+        for outdir in outdirs:
+            for p in outdir.glob(f"{i:02d}_*.mp3"):
                 p.unlink(missing_ok=True)
     if done:
         data["final_done"] = False
         tmp = prog.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         tmp.replace(prog)
-        # the combined file is now stale
-        (ws / "out.mp3").unlink(missing_ok=True)
+        # Final combined files and cached per-chapter zips are now stale.
+        for p in ws.glob("*.mp3"):
+            p.unlink(missing_ok=True)
+        for p in ws.glob("*.zip"):
+            p.unlink(missing_ok=True)
     return done
 
 
@@ -453,41 +531,66 @@ def save_sharing_settings(**kw: Any) -> Dict[str, Any]:
     return data
 
 
-def output_for_sharing(ws: Path) -> Optional[Path]:
-    """The single file to send to Drive or the phone.
+def _zip_output(ws: Path, outdir: Path) -> Optional[Path]:
+    """Cache a STORED zip of a per-chapter output directory."""
+    files = sorted(p for p in outdir.glob("*.mp3") if p.stat().st_size > 0)
+    if not files:
+        return None
+    zip_path = ws / ("out.zip" if outdir.name == "out" else f"{outdir.name}.zip")
+    newest = max(p.stat().st_mtime for p in files)
+    if not zip_path.exists() or zip_path.stat().st_mtime < newest:
+        tmp = zip_path.with_name(zip_path.name + ".tmp")
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
+            for p in files:
+                z.write(p, arcname=p.name)
+        tmp.replace(zip_path)
+    return zip_path
 
-    Prefers the combined ``out.mp3``; for ``--per-chapter`` books it caches a
-    STORED (no recompress) zip of ``out/*.mp3`` next to the workspace.
-    """
-    ws = Path(ws)
-    single = ws / "out.mp3"
-    if single.exists() and single.stat().st_size > 0:
-        return single
-    outdir = ws / "out"
-    if outdir.is_dir():
-        files = sorted(p for p in outdir.glob("*.mp3") if p.stat().st_size > 0)
-        if files:
-            zip_path = ws / "out.zip"
-            newest = max(p.stat().st_mtime for p in files)
-            if not zip_path.exists() or zip_path.stat().st_mtime < newest:
-                tmp = zip_path.with_suffix(".zip.tmp")
-                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
-                    for p in files:
-                        z.write(p, arcname=p.name)
-                tmp.replace(zip_path)
-            return zip_path
-    # Fall back to a title-named MP3 written by an older/manual run.
-    named = [p for p in ws.glob("*.mp3") if p.stat().st_size > 0]
-    if named:
-        return max(named, key=lambda p: p.stat().st_size)
+
+def _share_file(ws: Path, path: Path) -> Optional[Path]:
+    try:
+        if path.is_file() and path.suffix.lower() == ".mp3" and path.stat().st_size > 0:
+            return path
+        if path.is_dir():
+            return _zip_output(ws, path)
+    except OSError:
+        pass
     return None
 
 
-_UNSAFE_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+def output_for_sharing(ws: Path, out: Optional[Path] = None) -> Optional[Path]:
+    """The single file to send to Drive or the phone.
+
+    Uses the recorded output path first.  Combined books serve their MP3; for
+    ``--per-chapter`` books this caches a STORED (no recompress) zip next to the
+    workspace.  Older ``out.mp3``/``out/`` runs are still supported.
+    """
+    ws = Path(ws)
+    preferred = Path(out) if out else _meta_output(ws)
+    if preferred is not None:
+        found = _share_file(ws, preferred)
+        if found is not None:
+            return found
+
+    candidates: List[tuple] = []
+    for p in ws.glob("*.mp3"):
+        try:
+            if p.is_file() and p.stat().st_size > 0:
+                candidates.append((p.stat().st_mtime, p))
+        except OSError:
+            continue
+    for outdir in _output_dirs(ws):
+        files = [p for p in outdir.glob("*.mp3") if p.stat().st_size > 0]
+        if files:
+            candidates.append((max(p.stat().st_mtime for p in files), outdir))
+    if not candidates:
+        return None
+    newest = max(candidates, key=lambda item: item[0])[1]
+    return _share_file(ws, newest)
 
 
 def share_name(ws: Path, f: Optional[Path] = None) -> str:
-    """A human-readable download name (book title) for the shared file."""
+    """A human-readable download name (input filename) for the shared file."""
     ws = Path(ws)
     if f is None:
         f = output_for_sharing(ws)
@@ -498,6 +601,9 @@ def share_name(ws: Path, f: Optional[Path] = None) -> str:
         return f.name
     if f.name != "out.mp3":
         return f.name
+    clean = re.sub(r"\s+", " ", _UNSAFE_NAME.sub(" ", _meta_book_stem(ws))).strip()
+    if clean:
+        return f"{clean}{f.suffix or '.mp3'}"
     title = ""
     prog = ws / "work" / "progress.json"
     if prog.exists():

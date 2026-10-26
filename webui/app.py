@@ -1217,7 +1217,7 @@ def on_preview_command():
         argv += [
             "--cast-file", str(store.cast_path(S["ws"])),
             "--workdir", str(S["ws"] / "work"),
-            "-o", str(store.out_path(S["ws"], per_chapter)),
+            "-o", str(store.out_path(S["ws"], per_chapter, S["path"])),
         ]
     spec, _, error = _parse_chapter_range(S.get("chapter_range", "all"),
                                           len(S["book"].chapters))
@@ -1607,7 +1607,7 @@ def on_render(chapter_range: str, start_over: bool, confirm_restart: bool):
                 gr.update(value=False))
 
     per_chapter = bool(values.get("per_chapter"))
-    out = store.out_path(S["ws"], per_chapter)
+    out = store.out_path(S["ws"], per_chapter, S["path"])
     if per_chapter:
         out.mkdir(parents=True, exist_ok=True)
     argv = [str(S["path"])] + pspec.build_argv(values, extra=S.get("extra", ""))
@@ -1624,8 +1624,8 @@ def on_render(chapter_range: str, start_over: bool, confirm_restart: bool):
     fingerprint = _content_fingerprint(values, S.get("extra", ""))
     store.save_meta(
         S["ws"], last_argv=argv, chapters=spec, chapter_range=text,
-        per_chapter=per_chapter, last_job=job_spec.id,
-        params=S["params"], extra=S.get("extra", ""),
+        per_chapter=per_chapter, last_job=job_spec.id, output=str(out),
+        input=str(S["path"]), params=S["params"], extra=S.get("extra", ""),
         last_render_params=fingerprint, needs_rerender=False,
     )
     try:
@@ -1688,20 +1688,30 @@ def on_continue_job(selector: str):
                 f"finish before continuing."), rows, 0.0, "", book_md
 
     # Continue keeps the job's original content settings and chapters, but
-    # applies the current global runtime values.
+    # applies the current global runtime values and the EPUB-named output.
     args = [a for a in spec.args if a != "--fresh" and not a.startswith("--fresh=")]
     args = _set_flag(args, "--concurrency", RUNTIME["concurrency"])
     args = _set_flag(args, "--on-chunk-failure", RUNTIME["on_chunk_failure"])
+    out_path = spec.out_path
+    if not analyze:
+        out_path = store.out_path(spec.workdir.parent, spec.per_chapter, spec.book)
+        args = _set_flag(args, "-o", None)
+        args = _set_flag(args, "--output", None)
+        args += ["-o", str(out_path)]
     new_spec = JobSpec(
         book=spec.book, title=spec.title, cast_file=spec.cast_file,
-        workdir=spec.workdir, out_path=spec.out_path, args=args,
+        workdir=spec.workdir, out_path=out_path, args=args,
         chapters=spec.chapters, per_chapter=spec.per_chapter,
         kind=spec.kind,
     )
     if spec.per_chapter:
-        Path(spec.out_path).mkdir(parents=True, exist_ok=True)
+        Path(out_path).mkdir(parents=True, exist_ok=True)
     ws = spec.workdir.parent
-    store.save_meta(ws, last_job=new_spec.id)
+    meta_update = {"last_job": new_spec.id, "input": str(spec.book)}
+    if not analyze:
+        meta_update["output"] = str(out_path)
+        meta_update["per_chapter"] = spec.per_chapter
+    store.save_meta(ws, **meta_update)
     try:
         new_job = MANAGER.enqueue(new_spec, cwd=ROOT,
                                   log_path=store.job_log_path(ws, new_spec.id))
@@ -1720,10 +1730,10 @@ def on_continue_job(selector: str):
     state = "Queued" if new_job.state == "queued" else "Started"
     if analyze:
         return (f"**{state}** `{new_spec.short()}` — re-running analysis "
-                f"`{spec.short()}` · cast `{spec.out_path}`"), \
+                f"`{spec.short()}` · cast `{out_path}`"), \
             rows, 0.0, "", _book_run_md()
     return (f"**{state}** `{new_spec.short()}` — continuing `{spec.short()}` "
-            f"from saved chunks · output `{spec.out_path}`"), \
+            f"from saved chunks · output `{out_path}`"), \
         rows, 0.0, "", _book_run_md()
 
 
@@ -1755,8 +1765,39 @@ def on_cancel_all():
             _jobs_rows(), _book_run_md())
 
 
+def on_delete_job(selector: str):
+    """Delete one finished job from Activity; rendered files are kept."""
+    global SELECTED_JOB
+    job = _resolve_job(selector)
+    rows = _jobs_rows()
+    if job is None:
+        return "Select a finished job in the table first.", rows, _book_run_md()
+    if job.state in ("queued", "running", "stalled"):
+        return (f"Job `{job.spec.short()}` is {job.state}. Cancel it first, "
+                f"then delete it."), rows, _book_run_md()
+    for session in SESSIONS.values():
+        if session.get("analyze_job") == job.id:
+            return ("Wait for this analysis result to load before deleting "
+                    "the job."), rows, _book_run_md()
+    if not MANAGER.delete(job.id):
+        return f"Could not delete job `{job.spec.short()}`.", rows, _book_run_md()
+    if SELECTED_JOB == job.id:
+        SELECTED_JOB = None
+    for session in SESSIONS.values():
+        if session.get("last_job") == job.id:
+            session["last_job"] = None
+        if session.get("analyze_job") == job.id:
+            session["analyze_job"] = None
+    return (f"Deleted job `{job.spec.short()}` from Activity. "
+            f"Its log was removed; rendered audio and cast files were kept."), \
+        _jobs_rows(), _book_run_md()
+
+
 def on_clear_finished():
+    global SELECTED_JOB
     n = MANAGER.clear_finished()
+    if SELECTED_JOB and MANAGER.get(SELECTED_JOB) is None:
+        SELECTED_JOB = None
     return ((f"Cleared {n} finished job(s)." if n else "No finished jobs to clear."),
             _jobs_rows(), _book_run_md())
 
@@ -1865,7 +1906,7 @@ def on_phone_link(selector, base_url, request: gr.Request = None):
     job, ws = _share_target(selector)
     if not ws:
         return "", None, "Open a book or select a finished job first.", gr.skip()
-    file = store.output_for_sharing(ws)
+    file = store.output_for_sharing(ws, job.spec.out_path if job else None)
     if not file:
         return "", None, ("No finished MP3 yet for this book. Render it first, "
                           "or click a finished job's row."), gr.skip()
@@ -1902,7 +1943,7 @@ def on_phone_link(selector, base_url, request: gr.Request = None):
 
 def on_drive_upload(selector, remote, path):
     job, ws = _share_target(selector)
-    file = store.output_for_sharing(ws) if ws else None
+    file = store.output_for_sharing(ws, job.spec.out_path if job else None) if ws else None
     if not file:
         yield "Nothing to upload yet — render a book, or click a finished job's row."
         return
@@ -2236,12 +2277,13 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                 job_pick = gr.Textbox(
                     label="Selected job (id or #)", scale=3,
                     placeholder="Click a job row, or type its id",
-                    info="Continue and Cancel act on this job.")
+                    info="Continue, Cancel, and Delete act on this job.")
                 select_btn = gr.Button("Show job", scale=1)
             with gr.Row():
                 continue_btn = gr.Button("Continue selected job", scale=1)
                 cancel_btn = gr.Button("Cancel selected job", variant="stop", scale=1)
             with gr.Row():
+                delete_job_btn = gr.Button("Delete selected job", scale=1)
                 cancel_all_btn = gr.Button("Cancel all jobs", scale=1)
                 clear_btn = gr.Button("Clear finished jobs", scale=1)
 
@@ -2361,6 +2403,8 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                        outputs=[run_status, jobs_table, progress, log_box, book_run_md])
     cancel_btn.click(on_cancel_job, inputs=[job_pick],
                      outputs=[run_status, jobs_table, book_run_md])
+    delete_job_btn.click(on_delete_job, inputs=[job_pick],
+                         outputs=[run_status, jobs_table, book_run_md])
     cancel_all_btn.click(on_cancel_all,
                          outputs=[run_status, jobs_table, book_run_md])
     clear_btn.click(on_clear_finished,

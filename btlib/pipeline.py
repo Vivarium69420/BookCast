@@ -241,8 +241,18 @@ def run(args):
     for idx, chapter in enumerate(book.chapters, start=1):
         if selected_chapters is not None and idx not in selected_chapters:
             continue  # not requested this run — leave its state untouched
-        if store.is_chapter_combined_done(idx) and (not args.per_chapter or store.is_chapter_output_done(idx)):
-            continue  # this chapter is entirely finished already
+        ch_out = out_path / f"{idx:02d}_{slugify(chapter.title)}.mp3"
+        if store.is_chapter_combined_done(idx):
+            if not args.per_chapter:
+                continue  # this chapter is entirely finished already
+            if store.is_chapter_output_done(idx) and ch_out.exists():
+                continue
+            comb = store.chapter_combined_path(idx)
+            if comb.exists():
+                out_path.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(comb, ch_out)
+                store.mark_chapter_output_done(idx)
+                continue
 
         print(f"[{idx}/{len(book.chapters)}] {chapter.title}", file=sys.stderr)
         segments = chunk_chapter(chapter.text, max_chars=3000, distinguish_dialogue=not args.no_dialogue_voice)
@@ -311,11 +321,13 @@ def run(args):
         else:
             comb = store.chapter_combined_path(idx)
 
-        if args.per_chapter and not store.is_chapter_output_done(idx):
+        if args.per_chapter:
             out_path.mkdir(parents=True, exist_ok=True)
-            ch_out = out_path / f"{idx:02d}_{slugify(chapter.title)}.mp3"
-            shutil.copyfile(comb, ch_out)
-            store.mark_chapter_output_done(idx)
+            # The directory may have changed while the chunks stayed valid
+            # (for example when switching to an EPUB-named output folder).
+            if not store.is_chapter_output_done(idx) or not ch_out.exists():
+                shutil.copyfile(comb, ch_out)
+                store.mark_chapter_output_done(idx)
 
     if not args.per_chapter and (not store.is_final_done()
                                  or not out_path.exists()

@@ -409,6 +409,24 @@ class JobQueue:
                 n += 1 if self.cancel(job.id) else 0
         return n
 
+    def delete(self, job_id: str) -> bool:
+        """Remove a finished job from Activity and drop its log.
+
+        Audio/cast outputs are deliberately left on disk; this only clears the
+        queue history.  Queued or running jobs must be cancelled first.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.state in ("queued", "running", "stalled"):
+                return False
+            self._jobs.pop(job_id, None)
+            self._order = [i for i in self._order if i != job_id]
+        try:
+            job.log_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return True
+
     def clear_finished(self) -> int:
         with self._lock:
             keep = [i for i in self._order if self._jobs[i].state in
