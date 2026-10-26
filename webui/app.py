@@ -93,6 +93,7 @@ def _blank_session() -> Dict[str, Any]:
         "last_job": None,
         "pending_params": None,
         "pending_extra": "",
+        "pending_cast": None,
     }
 
 
@@ -103,6 +104,7 @@ def _activate(slug: Optional[str]) -> None:
     global S, ACTIVE_SLUG
     if slug and slug in SESSIONS:
         S = SESSIONS[slug]
+        S["pending_cast"] = None
         ACTIVE_SLUG = slug
     else:
         S = _blank_session()
@@ -399,7 +401,8 @@ def _cast_note(session: Optional[Dict[str, Any]] = None) -> str:
     session = session or S
     cast = session.get("cast")
     if cast:
-        return f"Loaded saved cast ({len(cast.get('characters', {}))} characters)."
+        return (f"Loaded saved cast ({len(cast.get('characters', []))} characters) · "
+                f"{castlib.source_label(cast)}.")
     return "No cast yet — press **Analyze cast**."
 
 
@@ -770,6 +773,8 @@ def _workspace_values(status: Optional[str] = None,
             "",
             gr.update(value=False, visible=False),
             False,
+            "",
+            gr.update(visible=False),
             *_param_widget_values(session),
         ]
 
@@ -799,6 +804,8 @@ def _workspace_values(status: Optional[str] = None,
         gr.update(value=False,
                   visible=bool(session.get("needs_rerender"))),
         False,
+        "",
+        gr.update(visible=False),
         *_param_widget_values(session),
     ]
 
@@ -1218,6 +1225,54 @@ def on_revert():
     rows, speakers, qs = _reload_cast(data)
     S["dirty"].clear()
     return rows, "Reverted to the previous cast." + note
+
+
+def on_cast_import_preview(file):
+    """Validate an LLM/Colab cast before it replaces the workspace cast."""
+    if not S.get("ws"):
+        S["pending_cast"] = None
+        return "Load a book first.", gr.update(visible=False)
+    if not file:
+        S["pending_cast"] = None
+        return "Choose a cast JSON file first.", gr.update(visible=False)
+    path = Path(file[0] if isinstance(file, (list, tuple)) else file)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        S["pending_cast"] = None
+        return f"**Could not read `{path}`:** {exc}", gr.update(visible=False)
+    ok, _problems, summary = castlib.validate_import(data, S.get("book"), S.get("cast"))
+    S["pending_cast"] = data if ok else None
+    return summary, gr.update(visible=ok)
+
+
+def on_cast_import_apply():
+    data = S.get("pending_cast")
+    if not data:
+        return (gr.update(), _cast_note(), gr.update(), gr.update(),
+                "Nothing validated to import.", gr.update(visible=False))
+    if not S.get("ws"):
+        return (gr.update(), _cast_note(), gr.update(), gr.update(),
+                "Load a book first.", gr.update(visible=False))
+    busy = _busy_reason()
+    if busy:
+        return (gr.update(), _cast_note(), gr.update(), gr.update(),
+                f"**Cannot replace the cast: {busy}.**", gr.update(visible=False))
+    castlib.save(S["ws"], data)
+    S["pending_cast"] = None
+    S["dirty"].clear()
+    # The CLI's resume signature hashes the cast *path*, not its contents.
+    # Drop any completed audio that used the old cast so a later render cannot
+    # silently keep the old speakers.
+    old_att = (S.get("cast") or {}).get("attribution") or {}
+    chapters = {int(k) for k in list(data.get("attribution") or {}) + list(old_att)
+                if str(k).isdigit()}
+    redone = store.invalidate_chapters(S["ws"], chapters)
+    rows, speakers, qs = _reload_cast(data)
+    note = f" Re-render queued for {len(redone)} chapter(s)." if redone else ""
+    return (rows, _cast_note(), qs, speakers,
+            f"**Imported cast applied** · {castlib.source_label(data)}. The previous "
+            f"cast is in `cast.json.bak`.{note}", gr.update(visible=False))
 
 
 def on_q_chapter(label: str, only: bool = True):
@@ -1814,6 +1869,11 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                 with gr.Row():
                     analyze_btn = gr.Button("Analyze cast (no TTS)", variant="secondary",
                                             scale=2)
+                gr.Markdown(
+                    "_High accuracy: run `analyze_only_heavy` in the Colab notebook "
+                    "(or a local Ollama), then import the cast JSON in **Cast & quotes**. "
+                    "`Analyze cast` here uses whatever engine is selected; with `heavy` it "
+                    "needs `llm_endpoint` to be reachable._")
                 book_status = gr.Markdown("")
 
             with gr.Accordion("Parameters", open=False):
@@ -1858,6 +1918,13 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
 
             with gr.Accordion("Cast & quotes", open=False):
                 cast_note = gr.Markdown("Analyze a book first.")
+                with gr.Row():
+                    cast_import = gr.File(label="Import cast JSON (Colab)", file_types=[".json"],
+                                          type="filepath", scale=3)
+                    cast_import_preview_btn = gr.Button("Validate import", scale=1)
+                cast_import_preview = gr.Markdown("")
+                cast_import_apply_btn = gr.Button("Apply imported cast", variant="primary",
+                                                  visible=False)
                 with gr.Row():
                     with gr.Column(scale=3):
                         cast_table = gr.Dataframe(
@@ -1996,6 +2063,7 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
         cast_table, cast_note, q_chapter, q_speaker, q_table, q_status,
         extra_args, params_status, params_review, confirm_params_btn,
         book_run_md, render_warning, confirm_restart, start_over,
+        cast_import_preview, cast_import_apply_btn,
         *PARAM_INPUTS,
     ]
     ACTIVITY_OUTPUTS = [job_pick, run_status, progress, log_box, audio_out, download_out]
@@ -2012,6 +2080,13 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
     analyze_btn.click(on_analyze,
                       outputs=[cast_table, cast_note, q_chapter, q_speaker,
                                book_status, book_run_md])
+    cast_import_preview_btn.click(on_cast_import_preview, inputs=[cast_import],
+                                  outputs=[cast_import_preview, cast_import_apply_btn])
+    cast_import_apply_btn.click(
+        on_cast_import_apply,
+        outputs=[cast_table, cast_note, q_chapter, q_speaker, cast_status,
+                 cast_import_apply_btn],
+    )
 
     apply_params_btn.click(on_apply_params, inputs=PARAM_INPUTS + [extra_args],
                            outputs=[params_status, params_review, confirm_params_btn])

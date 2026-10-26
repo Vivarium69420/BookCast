@@ -80,8 +80,9 @@ python run_eval.py --corpus pdnc --engine whole --limit 10 --save-json eval_resu
 ```
 
 Engines: `heuristic` (regex), `scene` (scene-structured turn-taking, `btlib/cast_scene.py`),
-`whole` (turn-taking HMM), `light` (HF QA model), `heavy` (local LLM via Ollama — needs
-a server; will report `SKIPPED` if absent).
+`whole` (turn-taking HMM), `light` (HF QA model), `heavy` (scene + LLM cast reconciliation
+and weak-line adjudication in `btlib/cast_llm.py`; needs Ollama / an OpenAI-compatible
+server and reports `SKIPPED` if absent).
 
 The `scene` engine is also available at runtime:
 
@@ -89,7 +90,11 @@ The `scene` engine is also available at runtime:
 python book_to_audio.py --analyze-only --multi-voice --scene-context book.epub
 ```
 
-## Current baselines
+## Pre-fix baselines (historical)
+
+These are the numbers produced before the scorer fix described below.  Keep
+them only for comparison with older notes; use the corrected table for current
+work.
 
 `python run_baseline.py --corpus pdnc --engines heuristic scene whole` (all 28 novels)
 and the same on LitBank:
@@ -111,6 +116,52 @@ identical across engines. At the operational cap of 12 characters per book,
 characters are present** under some name — but the cap itself bounds recall
 (~20 major characters per book vs. 12 slots), so the cap-free row (40 slots) is
 the truer measure of detection: precision 0.838, recall 0.728.
+
+### Corrected scorer (Oct 2026)
+
+The table above predates the scoring fix in `evaltools/runner.py` (both sides of
+the alias comparison are now canonicalised, and a token-subset fallback covers
+short forms missing from PDNC's alias tables). Re-running the same engines gives:
+
+| PDNC (28) | attr(given) | attr(e2e) | back-and-forth | unknown |
+|-----------|-------------|-----------|----------------|---------|
+| heuristic | 0.359 | 0.350 | 0.401 | 0.188 |
+| **scene** | **0.551** | **0.537** | **0.532** | **0.074** |
+| whole | 0.471 | 0.459 | 0.509 | 0.177 |
+
+Saved as `eval_results/corrected_{heuristic,scene,whole}.json`. Use these
+numbers for any "did the LLM help?" comparison; the old strict table is kept
+only as a historical record. The corrected scorer is now the default.
+
+### Scene + LLM engine
+
+`--engine heavy` now runs the scene engine and then uses a local Ollama (or
+OpenAI-compatible) model for two narrow jobs:
+
+1. **Cast reconciliation** — merge split identities, drop non-people, fix
+   gender/narrator. One request per book.
+2. **Weak-line adjudication** — only the fallback buckets are sent back to the
+   model, with the full scene and a closed cast list. Explicit tags are not
+   overridden.
+
+Run it on Colab (free T4) with the notebook's `analyze_only_heavy` mode or the
+optional PDNC cell; on a local machine with Ollama:
+
+```bash
+python run_eval.py --corpus pdnc --engine heavy --books ARoomWithAView Emma \
+    --llm-model qwen3:14b --llm-strategy weak --llm-cache-dir runs/llm_cache
+```
+
+`--llm-max-calls N` caps uncached requests for a smoke test. During a render a
+failed model call falls back to the scene result, so a listener never loses an
+audiobook because Ollama went away. `--analyze-only` and this evaluation harness
+are stricter: they raise instead of silently labelling scene numbers as "LLM".
+
+**Status:** the engine and harness are implemented, but no real model run has
+been recorded in this repo yet (the development machine has no GPU/Ollama). Do
+not treat the LLM path as an accuracy win until the optional Colab PDNC cell
+shows it clears the scene baseline (target: +3 points attribution, gender ≥
+0.95, no character-precision regression).
 
 The precision work (v8) rejects three classes of rubbish before they earn a
 voice — bare honorifics (`Mr` with no surname), non-persons (places, demonyms,

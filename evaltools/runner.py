@@ -37,7 +37,12 @@ def run_engine(doc: Doc, engine: str, max_characters: int = 12,
                narrator_gender: Optional[str] = None,
                unknown_below: Optional[float] = None,
                llm_model: Optional[str] = None,
-               llm_endpoint: Optional[str] = None) -> Tuple[dict, float]:
+               llm_endpoint: Optional[str] = None,
+               llm_strategy: str = "weak",
+               llm_batch_size: int = 8,
+               llm_confidence: float = 0.6,
+               llm_cache_dir: Optional[str] = None,
+               llm_max_calls: Optional[int] = None) -> Tuple[dict, float]:
     book = doc.to_book()
     t0 = time.time()
     if engine == "heuristic":
@@ -58,11 +63,19 @@ def run_engine(doc: Doc, engine: str, max_characters: int = 12,
         data = analyze_book_light(book, max_characters=max_characters,
                                   narrator_gender=narrator_gender)
     elif engine == "heavy":
-        from btlib.cast_heavy import analyze_book_heavy
-        data = analyze_book_heavy(book, max_characters=max_characters,
-                                  model=llm_model or "llama3:8b",
-                                  endpoint=llm_endpoint or "http://localhost:11434/api/generate",
-                                  narrator_gender=narrator_gender)
+        from btlib.cast_llm import analyze_book_llm
+        data = analyze_book_llm(book, max_characters=max_characters,
+                                model=llm_model or "llama3:8b",
+                                endpoint=llm_endpoint or "http://localhost:11434/api/generate",
+                                narrator_gender=narrator_gender,
+                                strategy=llm_strategy,
+                                batch_size=llm_batch_size,
+                                confidence_threshold=llm_confidence,
+                                cache_dir=llm_cache_dir,
+                                max_calls=llm_max_calls,
+                                # An eval must never silently report scene numbers
+                                # under the "heavy" label when Ollama is absent.
+                                strict=True)
     else:
         raise ValueError(f"unknown engine {engine!r}")
     return data, time.time() - t0
@@ -82,13 +95,25 @@ def _cast_tables(cast_data: dict):
     return chars, att, base
 
 
-def _make_resolver(doc: Doc):
-    alias_to_main = {}
+def _alias_to_main(doc: Doc) -> Dict[str, str]:
+    """Map every normalised alias to the normalised main name.
+
+    Values are normalised so callers can compare them directly to
+    ``_norm(gold_speaker)``; returning the raw main name made gender lookup
+    (``doc.genders`` is keyed by ``_norm(main)``) and gold-speaker counts fail
+    for multi-word names.
+    """
+    alias_to_main: Dict[str, str] = {}
     for main, als in doc.aliases.items():
+        main_n = _norm(main)
         for a in als:
-            alias_to_main.setdefault(a, main)
-        alias_to_main.setdefault(main, main)
-    use_aliases = bool(doc.aliases)
+            alias_to_main.setdefault(_norm(a), main_n)
+        alias_to_main.setdefault(main_n, main_n)
+    return alias_to_main
+
+
+def _make_resolver(doc: Doc):
+    alias_to_main = _alias_to_main(doc)
 
     def resolve(pred_name: Optional[str], gold_name: str) -> bool:
         if not pred_name:
@@ -96,27 +121,21 @@ def _make_resolver(doc: Doc):
         pn, gn = _norm(pred_name), _norm(gold_name)
         if pn in _UNKNOWN:
             return False
-        if use_aliases:
-            return alias_to_main.get(pn) == gn
+        # Canonicalise *both* sides.  The old code mapped the prediction but
+        # compared it to the raw gold string, so a correct prediction failed
+        # whenever PDNC labelled the quote with an alias ("Lucy" vs
+        # "Miss Honeychurch").
+        pn = alias_to_main.get(pn, pn)
+        gn = alias_to_main.get(gn, gn)
         if pn == gn:
             return True
-        # token-subset fallback (no alias table, e.g. LitBank coref names)
+        # Token-subset fallback: PDNC's alias tables omit common short forms
+        # ("Jake" for "Jake Barnes"), so without this 4.5% of quotes cannot be
+        # scored correctly no matter what the engine predicts.
         pt, gt = set(pn.split()), set(gn.split())
         return bool(pt) and bool(gt) and (pt <= gt or gt <= pt)
 
     return resolve
-
-
-def _alias_to_main(doc: Doc) -> Dict[str, str]:
-    """Map every normalised alias (and the normalised main name) to its raw
-    main name, so cast names and gold quote speakers resolve to the same key."""
-    alias_to_main: Dict[str, str] = {}
-    for main, als in doc.aliases.items():
-        for a in als:
-            alias_to_main.setdefault(a, main)
-        alias_to_main.setdefault(main, main)
-        alias_to_main.setdefault(_norm(main), main)
-    return alias_to_main
 
 
 def _cluster_identity_metrics(doc: Doc, chars: dict, exclude_ids: set, gold_counts: Dict[str, int]):

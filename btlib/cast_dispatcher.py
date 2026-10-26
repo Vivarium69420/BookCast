@@ -9,7 +9,7 @@ are called from ``pipeline.py``::
 
 Engine selection mirrors the CLI:
 
-    --heavy-model          -> btlib.cast_heavy.analyze_book_heavy  (local LLM)
+    --heavy-model          -> btlib.cast_llm.analyze_book_llm (scene + LLM)
     --light-model          -> btlib.cast_light.analyze_book_light  (HF QA model)
     --whole-book-context   -> btlib.cast_whole.analyze_book_whole  (turn-taking HMM)
     (default)              -> btlib.cast.analyze_book              (regex heuristic)
@@ -26,9 +26,9 @@ from typing import Optional
 from . import tts
 from .cast import analyze_book, cast_path_for
 
-# Bumped whenever the cast schema or the cache-key inputs change. v8 adds the
-# first-person narrator fields (`person`/`narrator`) to each character.
-CAST_VERSION = 16
+# Bumped whenever the cast schema or the cache-key inputs change. v17 adds the
+# LLM reconciliation / weak-line adjudication engine and stores its usage.
+CAST_VERSION = 17
 
 
 # --------------------------------------------------------------------------
@@ -52,7 +52,8 @@ def select_mode(args) -> str:
 def _mode_label(args, mode: str) -> str:
     """The human-readable ``mode`` string stored in the cast file."""
     if mode == "heavy":
-        return f"heavy-llm ({getattr(args, 'llm_model', 'unknown')})"
+        strategy = getattr(args, "llm_strategy", None) or "weak"
+        return f"heavy-llm ({getattr(args, 'llm_model', 'unknown')}, {strategy})"
     if mode == "light":
         return "lightweight-transformer"
     if mode == "whole":
@@ -62,10 +63,24 @@ def _mode_label(args, mode: str) -> str:
     return "heuristic"
 
 
+def _heavy_strategy(args) -> str:
+    strategy = getattr(args, "llm_strategy", None) or "weak"
+    return strategy if strategy in {"cast", "weak", "all"} else "weak"
+
+
 def _cache_tag(args, mode: str) -> str:
     """The short tag that also names the on-disk cast file."""
     if mode == "heavy":
-        return f"heavy:{getattr(args, 'llm_model', 'unknown')}"
+        try:
+            from .cast_llm import LLM_PROMPT_VERSION
+        except Exception:  # pragma: no cover - import should always work
+            LLM_PROMPT_VERSION = 1
+        max_calls = getattr(args, "llm_max_calls", None)
+        return (f"heavy:{getattr(args, 'llm_model', 'unknown')}:"
+                f"{_heavy_strategy(args)}:p{LLM_PROMPT_VERSION}:"
+                f"b{int(getattr(args, 'llm_batch_size', None) or 8)}:"
+                f"c{float(getattr(args, 'llm_confidence', None) or 0.6):.2f}:"
+                f"n{max_calls or 'all'}")
     return {"light": "light", "whole": "whole", "scene": "scene", "heuristic": "heuristic"}[mode]
 
 
@@ -98,14 +113,21 @@ def _build_cast(book, args, mode: str) -> dict:
     narrator_gender = getattr(args, "narrator_gender", None)
 
     if mode == "heavy":
-        from .cast_heavy import analyze_book_heavy
+        from .cast_llm import analyze_book_llm
 
-        return analyze_book_heavy(
+        max_calls = getattr(args, "llm_max_calls", None)
+        return analyze_book_llm(
             book,
             max_characters=max_characters,
             model=getattr(args, "llm_model", None) or "llama3:8b",
             endpoint=getattr(args, "llm_endpoint", None) or "http://localhost:11434/api/generate",
             narrator_gender=narrator_gender,
+            strategy=_heavy_strategy(args),
+            batch_size=int(getattr(args, "llm_batch_size", None) or 8),
+            confidence_threshold=float(getattr(args, "llm_confidence", None) or 0.6),
+            cache_dir=getattr(args, "llm_cache_dir", None) or None,
+            max_calls=int(max_calls) if max_calls else None,
+            strict=bool(getattr(args, "analyze_only", False)),
         )
 
     if mode == "light":
@@ -148,6 +170,8 @@ def _build_cast(book, args, mode: str) -> dict:
 
 def resolve_cast_file(in_path: Path, args) -> Path:
     """Where the cast JSON for this input (and engine) lives / is written."""
+    if getattr(args, "cast_out", None):
+        return Path(args.cast_out)
     if getattr(args, "cast_file", None):
         return Path(args.cast_file)
 
@@ -155,14 +179,17 @@ def resolve_cast_file(in_path: Path, args) -> Path:
     if mode == "heuristic":
         return cast_path_for(in_path)
 
-    tag = {"heavy": "heavy", "light": "light", "whole": "whole", "scene": "scene"}[mode]
+    if mode == "heavy":
+        tag = f"heavy-{_heavy_strategy(args)}"
+    else:
+        tag = {"light": "light", "whole": "whole", "scene": "scene"}[mode]
     return in_path.parent / f".{in_path.stem}.cast.{tag}.json"
 
 
 def generate_cast(in_path: Path, book, args) -> dict:
     """Return the cast for ``book``: an explicit --cast-file, a cached analysis,
     or a freshly built one (which is then saved)."""
-    if getattr(args, "cast_file", None):
+    if getattr(args, "cast_file", None) and not getattr(args, "cast_out", None):
         print(f"Using cast file: {args.cast_file}", file=sys.stderr)
         return json.loads(Path(args.cast_file).read_text(encoding="utf-8"))
 

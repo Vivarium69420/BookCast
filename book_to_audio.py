@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from btlib import pipeline, tts
+from btlib.llm import LLMError
 from btlib.pipeline import GracefulStop
 
 
@@ -51,6 +52,8 @@ def main():
     parser.add_argument("--analyze-only", action="store_true",
                         help="Run character-detection and attribution pass, save cast file, and exit.")
     parser.add_argument("--cast-file", help="Use an existing cast.json instead of generating one.")
+    parser.add_argument("--cast-out", help="When using --analyze-only, write the new cast JSON here "
+                                           "(instead of next to the input book).")
     parser.add_argument("--whole-book-context", "--whole-book", dest="whole_book_context", action="store_true",
                         help="Global HMM attribution heuristic across the entire book.")
     parser.add_argument("--scene-context", "--scene", dest="scene_context", action="store_true",
@@ -88,11 +91,24 @@ def main():
     ai_group.add_argument("--light-model", action="store_true",
                           help="Use local Hugging Face transformer (helliun/quote-attribution) for attribution.")
     ai_group.add_argument("--heavy-model", action="store_true",
-                          help="Use local LLM (Ollama/OpenAI compatible) for attribution.")
+                          help="Use a local LLM (Ollama/OpenAI-compatible) to reconcile the cast and "
+                               "adjudicate the scene engine's uncertain lines.")
     ai_group.add_argument("--llm-model", default="llama3:8b",
                           help="Model tag for --heavy-model (default: 'llama3:8b').")
     ai_group.add_argument("--llm-endpoint", default="http://localhost:11434/api/generate",
-                          help="API URL for --heavy-model (default: 'http://localhost:11434/api/generate').")
+                          help="Ollama /api/generate or OpenAI-compatible /v1/chat/completions URL.")
+    ai_group.add_argument("--llm-strategy", choices=["cast", "weak", "all"], default="weak",
+                          help="LLM work: 'cast' (reconcile cast only), 'weak' (default: cast + "
+                               "uncertain lines), or 'all' (every dialogue line; ablation only).")
+    ai_group.add_argument("--llm-batch-size", type=int, default=8,
+                          help="Target dialogue lines per adjudication request (default: 8).")
+    ai_group.add_argument("--llm-confidence", type=float, default=0.6,
+                          help="Minimum model confidence before an override is applied (default: 0.6).")
+    ai_group.add_argument("--llm-cache-dir", default=None,
+                          help="Where to cache model responses (default: runs/llm_cache; put this "
+                               "on Google Drive in Colab to resume after a disconnect).")
+    ai_group.add_argument("--llm-max-calls", type=int, default=None,
+                          help="Optional cap on uncached model calls for a test run.")
 
     args = parser.parse_args()
 
@@ -131,7 +147,10 @@ def main():
     if args.analyze_only:
         if not args.input:
             parser.error("input is required for --analyze-only")
-        pipeline.analyze_only(args)
+        try:
+            pipeline.analyze_only(args)
+        except LLMError as exc:
+            sys.exit(f"LLM analysis failed: {exc}")
         return
 
     if not args.input or not args.output:

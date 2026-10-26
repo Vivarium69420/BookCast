@@ -157,6 +157,12 @@ is also distorted: *A Room with a View* is 0.269 strict but **0.516** corrected;
 *The Age of Innocence* 0.149 (Mrs. Archer absorbing Newland Archer's lines,
 323 quotes), *A Handful of Dust* 0.51 (vocatives).
 
+> **Fixed (Oct 2026).** `evaltools/runner.py` now canonicalises both sides and
+> uses a token-subset fallback. Re-measured scene on all 28 PDNC novels:
+> **attr(given) 0.551, e2e 0.537, back-and-forth 0.532, unknown 0.074**
+> (`eval_results/corrected_scene.json`). The old strict table in `EVAL.md` is
+> kept only as a historical record.
+
 Any engine comparison or "did this change help?" measurement made before
 fixing the scorer is measuring the scorer as much as the engine.
 

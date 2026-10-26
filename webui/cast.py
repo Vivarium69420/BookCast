@@ -220,3 +220,159 @@ def character_sample(data: Dict[str, Any], chapter_texts: Dict[int, str],
             if len(seg.split()) >= min_words and len(seg) > len(best):
                 best = seg
     return best[:240]
+
+
+# ---------------------------------------------------------------- import
+def source_label(data: Optional[Dict[str, Any]]) -> str:
+    if not data:
+        return "none"
+    mode = str(data.get("mode") or "cast")
+    llm = data.get("llm") or {}
+    model = llm.get("model")
+    if model and model not in mode:
+        return f"{mode} · {model}"
+    return mode
+
+
+def _chapter_lengths(book) -> Dict[str, int]:
+    out = {}
+    for i, ch in enumerate(book.chapters, start=1):
+        out[str(i)] = len(split_dialogue_narration(ch.text))
+    return out
+
+
+def validate_import(data: Any, book=None, current: Optional[Dict[str, Any]] = None
+                    ) -> Tuple[bool, List[str], str]:
+    """Validate a cast JSON before it replaces the workspace cast.
+
+    Returns ``(ok, problems, summary_markdown)``.  Problems are fatal; the
+    summary always describes what would change.
+    """
+    problems: List[str] = []
+    warnings: List[str] = []
+    if not isinstance(data, dict):
+        return False, ["The file is not a JSON object."], ""
+
+    chars = data.get("characters")
+    if not isinstance(chars, list) or not chars:
+        problems.append("`characters` is missing or empty.")
+        chars = []
+
+    ids: List[str] = []
+    names: Dict[str, str] = {}
+    genders: Dict[str, str] = {}
+    for i, c in enumerate(chars):
+        if not isinstance(c, dict):
+            problems.append(f"Character #{i + 1} is not an object.")
+            continue
+        cid = c.get("id")
+        if not cid or not isinstance(cid, str):
+            problems.append(f"Character #{i + 1} has no string `id`.")
+            continue
+        if cid in names:
+            problems.append(f"Duplicate character id `{cid}`.")
+            continue
+        ids.append(cid)
+        names[cid] = str(c.get("name") or cid)
+        genders[cid] = str(c.get("gender") or "")
+    if "unknown" not in names:
+        problems.append("No `unknown` bucket; every attribution needs somewhere to fall back to.")
+
+    att = data.get("attribution")
+    if not isinstance(att, dict):
+        problems.append("`attribution` is missing or is not an object.")
+        att = {}
+
+    lengths = _chapter_lengths(book) if book is not None else {}
+    lines = unknown = 0
+    methods: Counter = Counter()
+    for key, entries in att.items():
+        if not isinstance(entries, list):
+            problems.append(f"Chapter `{key}` is not a list.")
+            continue
+        if lengths and str(key) not in lengths:
+            problems.append(f"Chapter `{key}` is outside the opened book ({len(lengths)} chapters).")
+            continue
+        for e in entries:
+            if not isinstance(e, dict):
+                problems.append(f"Chapter `{key}` has a non-object attribution row.")
+                continue
+            seg = e.get("seg_idx")
+            if not isinstance(seg, int):
+                problems.append(f"Chapter `{key}` has a non-integer `seg_idx`.")
+                continue
+            if lengths and not (0 <= seg < lengths[str(key)]):
+                problems.append(f"Chapter `{key}` segment {seg} is out of range "
+                                f"(0-{lengths[str(key)] - 1}).")
+            cid = e.get("character_id")
+            if cid in (None, ""):
+                problems.append(f"Chapter `{key}` segment {seg} has no `character_id`.")
+            elif cid not in names:
+                problems.append(f"Chapter `{key}` segment {seg} refers to unknown id `{cid}`.")
+            lines += 1
+            unknown += int(cid in (None, "", "unknown", "minor_m", "minor_f"))
+            methods[str(e.get("method") or "")] += 1
+
+    if book is not None and data.get("book_title"):
+        if str(data["book_title"]).strip().lower() != str(book.title).strip().lower():
+            warnings.append(f"Book title differs: cast has `{data['book_title']}`, "
+                            f"open book is `{book.title}`. Check the chapter/segment "
+                            "references before applying.")
+
+    # Diff summary (not fatal).
+    old_lines: Dict[Tuple[str, int], Optional[str]] = {}
+    if current:
+        for key, entries in (current.get("attribution") or {}).items():
+            for e in entries:
+                if isinstance(e, dict) and isinstance(e.get("seg_idx"), int):
+                    old_lines[(str(key), e["seg_idx"])] = e.get("character_id")
+    changed = 0
+    for key, entries in att.items():
+        for e in entries:
+            if (isinstance(e, dict) and isinstance(e.get("seg_idx"), int)
+                    and old_lines.get((str(key), e["seg_idx"]), e.get("character_id")) != e.get("character_id")):
+                changed += 1
+
+    old_ids = {c.get("id") for c in (current or {}).get("characters", [])}
+    new_ids = set(ids)
+    added = sorted(new_ids - old_ids)
+    removed = sorted(old_ids - new_ids)
+    renamed = []
+    if current:
+        old_names = {c.get("id"): c.get("name") for c in current.get("characters", [])}
+        old_genders = {c.get("id"): c.get("gender") for c in current.get("characters", [])}
+        renamed = [f"`{cid}`: {old_names.get(cid)} → {names[cid]}"
+                   for cid in new_ids & old_ids if old_names.get(cid) != names[cid]]
+    else:
+        old_genders = {}
+    gender_changes = [f"`{cid}`: {old_genders.get(cid) or '—'} → {genders.get(cid) or '—'}"
+                      for cid in sorted(new_ids & set(old_genders))
+                      if (old_genders.get(cid) or "") != (genders.get(cid) or "")]
+
+    lines_md = [
+        f"**Source:** {source_label(data)}",
+        f"**Cast:** {len(ids)} characters · **attributed lines:** {lines} "
+        f"· **unknown/minor:** {unknown} ({unknown / max(lines, 1):.0%})",
+    ]
+    if current:
+        lines_md.append(f"**Diff:** {changed} line(s) changed · {len(added)} added · "
+                        f"{len(removed)} removed · {len(renamed)} renamed · "
+                        f"{len(gender_changes)} gender change(s)")
+        if renamed:
+            lines_md.append("Renamed: " + "; ".join(renamed[:12])
+                            + (" …" if len(renamed) > 12 else ""))
+        if gender_changes:
+            lines_md.append("Gender: " + "; ".join(gender_changes[:12])
+                            + (" …" if len(gender_changes) > 12 else ""))
+    if methods:
+        top = ", ".join(f"`{m}`={n}" for m, n in methods.most_common(6))
+        lines_md.append(f"**Methods:** {top}")
+    if warnings:
+        lines_md.append("**Warnings:** " + " ".join(warnings))
+
+    if problems:
+        lines_md.append("\n**Cannot import:**\n" + "\n".join(f"- {p}" for p in problems[:16]))
+    else:
+        lines_md.append("\n**Ready to apply.** This replaces the current cast; the old file "
+                        "is kept as `cast.json.bak`.")
+    return not problems, problems, "\n\n".join(lines_md)

@@ -19,6 +19,7 @@ import sys
 import time
 from pathlib import Path
 
+from btlib.llm import LLMError
 from evaltools.align import verify_segmentation_matches_extract
 from evaltools.corpora import Doc, load_litbank, load_pdnc
 from evaltools.runner import evaluate
@@ -52,6 +53,11 @@ def main() -> int:
     ap.add_argument("--unknown-below", type=float, default=None)
     ap.add_argument("--llm-model", default=None)
     ap.add_argument("--llm-endpoint", default=None)
+    ap.add_argument("--llm-strategy", choices=["cast", "weak", "all"], default="weak")
+    ap.add_argument("--llm-batch-size", type=int, default=8)
+    ap.add_argument("--llm-confidence", type=float, default=0.6)
+    ap.add_argument("--llm-cache-dir", default=None)
+    ap.add_argument("--llm-max-calls", type=int, default=None)
     ap.add_argument("--limit", type=int, default=None, help="first N books only")
     ap.add_argument("--per-book", action="store_true")
     ap.add_argument("--save-json", default=None, help="write metrics to this JSON file")
@@ -84,14 +90,23 @@ def main() -> int:
           f"({args.corpus}). Engine = {args.engine}.", file=sys.stderr)
 
     t0 = time.time()
-    total, per_doc = evaluate(
-        docs, args.engine,
-        max_characters=args.max_characters,
-        narrator_gender=args.narrator_gender,
-        unknown_below=args.unknown_below,
-        llm_model=args.llm_model,
-        llm_endpoint=args.llm_endpoint,
-    )
+    try:
+        total, per_doc = evaluate(
+            docs, args.engine,
+            max_characters=args.max_characters,
+            narrator_gender=args.narrator_gender,
+            unknown_below=args.unknown_below,
+            llm_model=args.llm_model,
+            llm_endpoint=args.llm_endpoint,
+            llm_strategy=args.llm_strategy,
+            llm_batch_size=args.llm_batch_size,
+            llm_confidence=args.llm_confidence,
+            llm_cache_dir=args.llm_cache_dir,
+            llm_max_calls=args.llm_max_calls,
+        )
+    except LLMError as exc:
+        print(f"SKIPPED {args.engine}: {exc}", file=sys.stderr)
+        return 1
     wall = time.time() - t0
 
     label = f"{args.corpus} / {args.engine} / {len(docs)} books / {wall:.1f}s"

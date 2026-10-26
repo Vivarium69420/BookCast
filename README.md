@@ -33,7 +33,9 @@ book_to_audio/
     ├── cast.py             # Regex heuristic attribution + CastStore cache
     ├── cast_whole.py       # Whole-book HMM attribution
     ├── cast_light.py       # Local Hugging Face attribution (--light-model)
-    ├── cast_heavy.py       # Local LLM / Ollama attribution (--heavy-model)
+    ├── cast_llm.py         # Scene + LLM cast reconciliation / weak-line adjudication
+    ├── cast_heavy.py       # Legacy local-LLM wrapper (kept for old imports)
+    ├── llm.py              # Ollama / OpenAI-compatible client + response cache
     ├── cast_dispatcher.py  # Picks the attribution engine
     └── pipeline.py         # Orchestration: synth, retry, concat
 ```
@@ -66,7 +68,9 @@ Workflow (one page per open book, plus a shared Activity panel):
    render then warns and asks for confirmation because it will discard saved chunks. **Revert**
    restores the applied settings. Presets and an exact-command preview live in the same panel.
 4. **Cast & quotes** – edit names/genders/voices/pitch, merge or delete characters, audition a
-   line. Changing a gender offers the first unused voice from that gender's pool; any voice can
+   line. **Import cast JSON** accepts a cast produced by the Colab `analyze_only_heavy` mode;
+   it validates the chapter/segment references and shows a diff before replacing the workspace
+   cast. Changing a gender offers the first unused voice from that gender's pool; any voice can
    be overridden. **Quotes** lists each dialogue line (optionally only uncertain ones) and lets
    you reassign it.
 5. **Render this book** – **Render / continue current book** starts the active book now (or waits
@@ -167,32 +171,71 @@ python book_to_audio.py --sample
 
 Interrupted runs resume automatically. Use `--fresh` to start over.
 
-## 3 modes for character attribution
+## Attribution engines
 
-1. **Heuristic (default, fast, no extra dependencies)**
+1. **Scene (UI default; recommended offline engine)**
+   ```bash
+   python book_to_audio.py book.epub -o book.mp3 --multi-voice --scene-context
+   ```
+   The bare CLI still defaults to the legacy regex heuristic; the web UI defaults
+   to scene because it is the best measured offline engine on PDNC. It uses
+   paragraph/scene turn-taking, action beats, vocatives, and presence cues.
+
+2. **Heuristic (legacy, fastest)**
    ```bash
    python book_to_audio.py book.epub -o book.mp3 --multi-voice
-   # Smarter global pass across the whole book:
+   ```
+
+3. **Whole-book HMM**
+   ```bash
    python book_to_audio.py book.epub -o book.mp3 --multi-voice --whole-book-context
    ```
 
-2. **Lightweight local transformer** (`pip install transformers torch`)
+4. **Lightweight local transformer** (`pip install transformers torch`)
    ```bash
    python book_to_audio.py book.epub -o book.mp3 --multi-voice --light-model
    ```
 
-3. **Heavy-hitter local LLM** (Ollama or compatible endpoint)
+5. **Scene + LLM adjudication** (Colab GPU or a local Ollama)
    ```bash
-   ollama pull llama3:8b
-   python book_to_audio.py book.epub -o book.mp3 --multi-voice --heavy-model
+   ollama pull qwen3:14b
    python book_to_audio.py book.epub -o book.mp3 --multi-voice --heavy-model \
-       --llm-model qwen2.5:14b --llm-endpoint http://localhost:11434/api/generate
+       --llm-model qwen3:14b --llm-strategy weak
    ```
+   This keeps the deterministic scene engine as the base. The model only:
+   - reconciles the cast (split identities, junk names, gender, first-person narrator), and
+   - re-asks the uncertain fallback lines (`scene-single`, `pronoun`, `action-beat`, ...)
+     with the full scene and a **closed** cast list.
+
+   Explicit `"X said"` tags are never overridden. Every response is cached in
+   `runs/llm_cache/` (or `--llm-cache-dir`), so a rerun/Colab reconnect resumes.
+   `--llm-strategy cast` does the cast pass only; `--llm-strategy all` is an ablation.
+   The OpenAI-compatible `/v1/chat/completions` shape is also supported; point
+   `--llm-endpoint` at it and set `LLM_API_KEY` / `OPENAI_API_KEY` if needed.
+
+### Colab: generate a cast, render locally
+
+The free T4 route is the recommended one for this CPU-only machine:
+
+1. Put the EPUB in `MyDrive/book_to_audio/books/` and open `book_to_audio_colab.ipynb`.
+2. Run steps 1–5 with `MODE = "analyze_only_heavy"` and a model such as `qwen3:14b`.
+   This is text-only (no TTS) and writes `MyDrive/book_to_audio/casts/<book>.cast.json`.
+3. Download the small cast JSON, use **Cast & quotes → Import cast JSON** in the local UI,
+   then **Validate import → Apply imported cast**.
+4. Render locally. The pipeline already receives the imported cast as `--cast-file`.
+
+The notebook also has an optional PDNC evaluation cell (six novels, text-only) so the
+LLM change is measured before it becomes trusted. The LLM engine is **not yet
+validated with a real model in this repo**; the scene engine remains the UI
+default and the only benchmark-proven path until that cell clears the gate.
 
 Preview the cast without synthesizing:
 
 ```bash
 python book_to_audio.py book.epub --analyze-only --multi-voice
+# or, on a machine with Ollama:
+python book_to_audio.py book.epub --analyze-only --multi-voice --heavy-model \
+    --llm-model qwen3:14b --cast-out /tmp/book.cast.json
 ```
 
 ## Voice priority
