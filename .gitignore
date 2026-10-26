@@ -21,6 +21,7 @@ models/
 *.m4a
 .*.book_to_audio_progress/
 book_to_audio.zip
+book_to_audio_complete.zip
 *_attribution.tsv
 
 # Local caches
