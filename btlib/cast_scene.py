@@ -31,7 +31,7 @@ from . import cast as base
 from .extract import split_dialogue_narration
 from .models import Book
 
-SCENE_VERSION = 9
+SCENE_VERSION = 10
 
 # A narration gap longer than this (characters) is treated as a scene break.
 SCENE_GAP = 500

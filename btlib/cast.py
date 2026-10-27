@@ -26,7 +26,7 @@ from .models import Book
 from .names import name_gender
 from .tts import VOICE_BANK
 
-HEURISTIC_VERSION = 16  # bump whenever the attribution logic changes meaningfully
+HEURISTIC_VERSION = 17  # bump whenever the attribution logic changes meaningfully
 
 # Past tense AND present tense (base + third-person -s) — a book that
 # mixes tenses (present-tense scenes are common for flashbacks, dream
