@@ -18,6 +18,9 @@ engine is both **more accurate** and **much faster** than the HMM:
 | LitBank | **scene** | **0.304** | **0.298** | **0.292** | 0.2 s |
 | LitBank | whole | 0.260 | 0.288 | 0.450 | 0.4 s |
 
+These are the original pre-scorer-fix numbers.  Current corrected PDNC numbers
+and the v17 first-appearance changes are in `EVAL.md`.
+
 ## How it works
 
 1. **Scene segmentation.** A chapter is cut into scenes at long narration gaps
@@ -28,9 +31,11 @@ engine is both **more accurate** and **much faster** than the HMM:
    vocatives) via a book-wide token → character map.
 
 3. **Participants.** Characters actually *tagged as speaking* in the scene,
-   ordered by how often. When a scene has more than two, alternatives are drawn
-   from the top two, because the overwhelming majority of scenes are
-   two-handers.
+   ordered by how often, plus anyone who introduces themselves ("Hi, I'm
+   Willem"). When a scene has more than two, alternatives are drawn from the
+   top two, because the overwhelming majority of scenes are two-handers.  A
+   first-person narrator joins a scene that names only one other character, so
+   replies alternate back to the narrator instead of staying on that one name.
 
 4. **Paragraph groups.** Consecutive quotes are grouped when the narration
    between them has no blank line. Measured on PDNC, this is a very strong
@@ -49,6 +54,13 @@ engine is both **more accurate** and **much faster** than the HMM:
 5. **Constrained turn-taking.** New-paragraph untagged lines alternate among the
    participants (or, failing that, the scene's presence), with vocatives marking
    the addressee so the speaker is someone else.
+
+6. **First appearances.** A pronoun tag with no named character of that gender
+   in the scene falls back to `minor_m` / `minor_f` rather than a named
+   character of the opposite gender.  If the adjacent narration continues to
+   say "he"/"she", a recently-heard minor keeps the turn.  This is how an
+   unnamed character ("I think she's right," he says) gets a male voice before
+   the book reveals his name.
 
 ## Shared improvements this work also landed
 

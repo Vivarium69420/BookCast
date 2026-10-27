@@ -11,8 +11,12 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from btlib import cast as castlib
 from btlib.cast_llm import _apply_cast_updates, _apply_results
+from btlib.cast_scene import analyze_book_scene
 from btlib.llm import LLMClient
+from btlib.models import Book, Chapter
+from webui import cast as webcast
 from evaltools.corpora import Doc
 from evaltools.runner import _alias_to_main, _make_resolver
 
@@ -178,6 +182,74 @@ class ClientCacheTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+
+class FirstAppearanceTests(unittest.TestCase):
+    def test_embedded_self_introduction_resolves_speaker(self):
+        cid = castlib.self_introduced_name(
+            "“Hi, Lulu, I’m Willem.”",
+            {"Willem": "Willem", "Lulu": "Lulu"},
+            {"Willem": "c2", "Lulu": "c4"},
+        )
+        self.assertEqual(cid, "c2")
+
+    def test_self_introduction_ignores_non_names(self):
+        self.assertIsNone(castlib.self_introduced_name(
+            "“I’m fine.”", {"Willem": "Willem"}, {"Willem": "c2"}))
+
+    def test_strict_action_beat_rejects_distant_mention(self):
+        segments = [
+            ("narration", "She thought about it. Was all this just buttering "
+                          "me up so he could hit on Melanie?"),
+            ("dialogue", "“No.”"),
+            ("narration", " He peers at her. "),
+        ]
+        broad = castlib._tag_dialogue_segments(segments, {"Melanie"})
+        strict = castlib._tag_dialogue_segments(
+            segments, {"Melanie"}, strict_action_beats=True)
+        self.assertEqual(broad[1][0], "Melanie")
+        self.assertIsNone(strict[1][0])
+
+    def test_strict_action_beat_rejects_quoted_word(self):
+        segments = [
+            ("narration", "\n\nLouise\n. I like that.\n\n"),
+            ("dialogue", "“No, not Louise. Lulu.”"),
+            ("narration", " He reaches out his hand. "),
+        ]
+        strict = castlib._tag_dialogue_segments(
+            segments, {"Louise", "Lulu"}, strict_action_beats=True)
+        self.assertIsNone(strict[1][0])
+
+    def test_unnamed_male_pronoun_gets_male_minor_voice(self):
+        book = Book(title="Tiny", chapters=[Chapter(title="One", text=(
+            "Melanie and Allyson stood by the door, fanning themselves. "
+            "“It is hot,” Melanie said. "
+            "“Very hot,” Allyson said. "
+            "A stranger walked up to them. "
+            "“I think she is right,” he said. "
+            "“Thank you,” Melanie said. "
+            "“You are welcome,” he said. "
+        ))])
+        data = analyze_book_scene(book, max_characters=8)
+        rows = {e["seg_idx"]: e for e in data["attribution"]["1"]}
+        self.assertEqual(rows[5]["character_id"], "minor_m")
+        self.assertEqual(rows[5]["method"], "pronoun-male")
+
+
+class DuplicateVoiceTests(unittest.TestCase):
+    def test_named_characters_cannot_share_a_voice(self):
+        data = {
+            "characters": [
+                {"id": "c1", "name": "Allyson", "voice": "voice-a"},
+                {"id": "c2", "name": "Melanie", "voice": "voice-b"},
+            ],
+            "attribution": {},
+        }
+        ok, msg = webcast.apply(data, "c2", voice="voice-a")
+        self.assertFalse(ok)
+        self.assertIn("already used", msg)
+        self.assertEqual(data["characters"][1]["voice"], "voice-b")
 
 
 if __name__ == "__main__":

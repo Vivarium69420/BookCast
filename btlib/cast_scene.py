@@ -141,7 +141,14 @@ def analyze_book_scene(book: Book, max_characters: int = 12,
     tagged_raw_names = set()
     for chapter in book.chapters:
         segments = split_dialogue_narration(chapter.text)
-        tags = base._tag_dialogue_segments(segments, midsentence_caps)
+        # Broad tags discover the cast; strict tags attribute lines.  Keeping
+        # the two separate avoids losing a character whose name only appears
+        # in a narrator aside while still refusing that mention as a speaker.
+        tags = base._tag_dialogue_segments(
+            segments, midsentence_caps, unique_pronoun_narration=True)
+        strict_tags = base._tag_dialogue_segments(
+            segments, midsentence_caps, strict_action_beats=True,
+            unique_pronoun_narration=True)
         for seg_idx, (kind, text) in enumerate(segments):
             if kind != "dialogue":
                 continue
@@ -150,7 +157,7 @@ def analyze_book_scene(book: Book, max_characters: int = 12,
                 raw_name_counts[name] += 1
                 if method == "tag":
                     tagged_raw_names.add(name)
-        chapter_scans.append((segments, tags))
+        chapter_scans.append((segments, strict_tags))
 
     # --- Cluster + rank characters (same identity model as the heuristic) ---
     clusters, name_to_root = base._cluster_names(raw_name_counts)
@@ -160,6 +167,7 @@ def analyze_book_scene(book: Book, max_characters: int = 12,
     base.add_minor_characters(characters)  # Unknown stays the final state
     base.assign_voices(characters)
     char_by_id = {c["id"]: c for c in characters}
+    narrator_id = next((c["id"] for c in characters if c.get("narrator")), None)
 
     token_char = _token_char_map(raw_name_counts, name_to_root, root_to_id)
 
@@ -179,17 +187,46 @@ def analyze_book_scene(book: Book, max_characters: int = 12,
             # scene": in a two-hander, the tagged tag-team *is* the dialogue.
             participants: List[str] = []
             part_counts: Counter = Counter()
+            first_tagged: Optional[str] = None
             for seg_idx in range(s_start, s_end):
                 if segments[seg_idx][0] != "dialogue":
                     continue
-                raw_name = tags.get(seg_idx, (None, "", ""))[0]
-                if not raw_name:
-                    continue
-                cid = root_to_id.get(name_to_root.get(raw_name))
+                raw_name, _snip, method = tags.get(seg_idx, (None, "", ""))
+                if raw_name:
+                    cid = root_to_id.get(name_to_root.get(raw_name))
+                    if cid:
+                        part_counts[cid] += 1
+                        if first_tagged is None and method in ("tag", "narrator"):
+                            first_tagged = cid
+                # A self-introduction ("Hi, I'm Willem") is a speaker
+                # announcement, not just a mention.  It is often the first
+                # time a character speaks, before narration has tagged them.
+                cid = base.self_introduced_name(
+                    segments[seg_idx][1], name_to_root, root_to_id)
                 if cid:
                     part_counts[cid] += 1
+                    if first_tagged is None:
+                        first_tagged = cid
+            # A first-person narrator is a participant even when the scene
+            # only names one other person.  Without this, an untagged reply
+            # such as "No. It's already all arranged." inherits the other
+            # character's voice, which is especially confusing when both are
+            # women.  Only do it for a one-person scene: a scene with two
+            # tagged others is usually a conversation the narrator is
+            # observing, not part of.
+            if narrator_id and narrator_id not in part_counts:
+                named_present = [c for c in presence if c != "unknown"]
+                if len(part_counts) == 1:
+                    part_counts[narrator_id] = 0
+                elif not part_counts and len(named_present) == 1:
+                    part_counts[named_present[0]] = 1
+                    part_counts[narrator_id] = 0
             participants = [cid for cid, _ in part_counts.most_common()]
-            last: Optional[str] = None
+            # In a two-hander whose first quote is untagged, the first
+            # *tagged* line is usually the other speaker's reply.  Seed the
+            # alternation with it so the opening line does not inherit the
+            # most frequent tag by default.
+            last: Optional[str] = first_tagged if len(participants) == 2 else None
             recent: List[str] = []  # most recent first
 
             # Same-paragraph quotes are one speaker 96.8% of the time, so treat
@@ -228,6 +265,24 @@ def analyze_book_scene(book: Book, max_characters: int = 12,
                             pronoun_gender, recent + participants, char_by_id)
                         if cid:
                             character_id, confidence, method = cid, "medium", "pronoun"
+                        else:
+                            # No named speaker of that gender is active.  Do
+                            # not hand a "he says" line to a female character
+                            # just because she is the only participant; use a
+                            # male minor voice instead.  This is the common
+                            # first-appearance case ("... he says" before the
+                            # character is named).
+                            same_gender = [
+                                c for c in list(participants) + list(presence)
+                                if (char_by_id.get(c) or {}).get("gender") == pronoun_gender
+                            ]
+                            if same_gender:
+                                character_id = same_gender[0]
+                                confidence, method = "medium", "pronoun-presence"
+                            else:
+                                character_id = ("minor_m" if pronoun_gender == "male"
+                                                else "minor_f")
+                                confidence, method = "low", f"pronoun-{pronoun_gender}"
 
                     elif raw_name:
                         cid = root_to_id.get(name_to_root.get(raw_name))
@@ -256,11 +311,39 @@ def analyze_book_scene(book: Book, max_characters: int = 12,
                             character_id, confidence, method = _infer_speaker(
                                 text, presence, participants, last, recent, token_char)
 
-                    if group_guess is None and character_id not in (
+                    if not raw_name and character_id not in (
                             None, "unknown", "minor_m", "minor_f"):
+                        # Continue a recently-heard unnamed speaker when the
+                        # narration still says "he/she" and no named character
+                        # of that gender is in the scene.  This is the first
+                        # appearance of a character before the book names him
+                        # ("I think she's right," he says).  Restricting it to
+                        # an already-active minor keeps it from overriding
+                        # ordinary named dialogue elsewhere.
+                        resolved = char_by_id.get(character_id) or {}
+                        adjacent_gender = base.minor_gender(segments, seg_idx)
+                        if (adjacent_gender and resolved.get("gender")
+                                and resolved["gender"] != adjacent_gender):
+                            minor_id = ("minor_m" if adjacent_gender == "male"
+                                        else "minor_f")
+                            named_same_gender = any(
+                                (char_by_id.get(c) or {}).get("gender") == adjacent_gender
+                                and c not in ("minor_m", "minor_f", "unknown")
+                                for c in list(participants) + list(presence))
+                            if (not named_same_gender
+                                    and (last == minor_id or minor_id in recent)):
+                                character_id = minor_id
+                                confidence = "low"
+                                method = f"scene-gender-{adjacent_gender}"
+
+                    if group_guess is None and character_id not in (None, "unknown"):
                         # The next line(s) in this paragraph almost certainly
-                        # belong to the same speaker.
-                        group_guess = (character_id, confidence, "scene-same-par")
+                        # belong to the same speaker.  A pronoun-tagged minor
+                        # is still a real speaker; only a completely
+                        # unresolved/minor line should not seed the group.
+                        if (character_id not in ("minor_m", "minor_f")
+                                or (method or "").startswith("pronoun")):
+                            group_guess = (character_id, confidence, "scene-same-par")
 
                     if character_id != "unknown":
                         if last != character_id:

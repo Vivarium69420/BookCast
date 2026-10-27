@@ -73,8 +73,9 @@ Workflow (one page per open book, plus a shared Activity panel):
    line. **Import cast JSON** accepts a cast produced by the Colab `analyze_only_heavy` mode;
    it validates the chapter/segment references and shows a diff before replacing the workspace
    cast. Changing a gender offers the first unused voice from that gender's pool; any voice can
-   be overridden. **Quotes** lists each dialogue line (optionally only uncertain ones) and lets
-   you reassign it.
+   be overridden, but a named character cannot reuse another named character's voice (the editor
+   rejects the duplicate so the narrator and a major character cannot collapse into one voice).
+   **Quotes** lists each dialogue line (optionally only uncertain ones) and lets you reassign it.
 5. **Render this book** – **Render / continue current book** starts the active book now (or waits
    for a slot) and resumes from saved chunks automatically. The output file is named after the input
    EPUB/PDF filename (for example `My Book.epub` → `My Book.mp3`). **Start over** ignores saved
@@ -307,7 +308,11 @@ Convert in batches with `--chapters 1-10`, `--chapters 11-20`, ...; finished cha
   he/she clues; "the woman said" descriptors; first-person beats; people being addressed by name; and who is mentioned in the scene.
 - Pronoun-only tags (`"..." she says.`) resolve to the most recent speaker of that gender, so an explicit `she`/`he` cue
   cannot be given to a character of the other gender. A quote that is just a full name (`"Amanda Thomas," she says.`)
-  identifies the speaker.
-- Unnamed people get **gender-matched "minor" voices** instead of one generic Unknown voice.
+  identifies the speaker, as does an embedded introduction (`"Hi, I'm Willem."`).
+- Unnamed people get **gender-matched "minor" voices** instead of one generic Unknown voice; this includes a character
+  whose first lines are only `he says` / `she says` before the book names them.
+- The scene engine ignores a name that is merely mentioned several sentences away, is the object of a preposition
+  (`hit on Melanie`), or is a one-word quoted fragment (`Louise.`). That keeps a two-person conversation from
+  picking up false third participants.
 - `--light-model` / `--heavy-model` supply extra names to this model (cached after the first run).
 - Check the result without making audio: `--analyze-only --multi-voice` (add `--whole-book-context`, `--light-model` or `--heavy-model`).

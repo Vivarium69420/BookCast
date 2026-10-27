@@ -125,8 +125,8 @@ short forms missing from PDNC's alias tables). Re-running the same engines gives
 
 | PDNC (28) | attr(given) | attr(e2e) | back-and-forth | unknown |
 |-----------|-------------|-----------|----------------|---------|
-| heuristic | 0.359 | 0.350 | 0.401 | 0.188 |
-| **scene** | **0.551** | **0.537** | **0.532** | **0.074** |
+| heuristic | 0.360 | 0.350 | 0.402 | 0.188 |
+| **scene** | **0.566** | **0.551** | **0.554** | **0.093** |
 | whole | 0.471 | 0.459 | 0.509 | 0.177 |
 
 Saved as `eval_results/corrected_{heuristic,scene,whole}.json`. Use these
@@ -210,6 +210,51 @@ tags to the sentence touching the quote (helps precision on distant names, but
 costs ~0.02 attribution because legitimate beats get dropped), and running the
 pronoun pass with narration consumption (starves character discovery; charP
 0.851 to 0.818).
+
+## First appearances and duplicate voices (v17)
+
+Willem's first scene in *Just One Day* exposed two separate failure modes:
+the scene engine gave his first `he says` lines to Melanie/Allyson, and the
+saved cast gave Allyson and Melanie the same Edge voice.  The fixes are:
+
+- **Embedded self-introductions.** `self_introduced_name` now accepts
+  `Hi, I'm Willem.` / `My name is Willem.` in addition to a quote that is
+  exactly a cast name.  A self-introduction also joins the scene's participant
+  list, so the alternation knows the new speaker before narration tags him.
+- **Strict action beats for attribution.**  Cast discovery still uses the
+  liberal bare-name pass (a mention in the narrator's thoughts helps us learn
+  the cast).  Attribution uses a strict variant that only looks at the sentence
+  touching the quote, rejects questions, prepositional objects (`hit on
+  Melanie`), and one-word fragments (`Louise.`).  This removes the false
+  participants that made a two-hander look like a three-hander.
+- **Pronoun fallback.**  A `he says` / `she says` tag with no named character
+  of that gender in the scene now goes to `minor_m` / `minor_f`, not to a
+  named character of the opposite gender.  Adjacent narration can continue a
+  recently-heard minor through the same turn (`he opens his arms`), which is
+  how Willem is voiced before the book names him.
+- **Narrator in one-person scenes.**  A first-person narrator joins a scene
+  that names only one other character, so a reply such as `No. It's already
+  all arranged.` alternates back to the narrator instead of staying on the
+  named character.
+- **Unique named voices.**  The cast editor rejects assigning a voice already
+  used by another named character.  The narrator and a major character can no
+  longer silently collapse into the same voice; use a different voice or pitch
+  instead.
+
+Measured on all 28 PDNC novels with the corrected scorer:
+
+| PDNC (28) | attr(given) | attr(e2e) | back-and-forth | unknown | gender | charP | charR |
+|-----------|-------------|-----------|----------------|---------|--------|-------|-------|
+| scene before v17 | 0.551 | 0.537 | 0.532 | 0.074 | 0.931 | 0.874 | 0.476 |
+| **scene after v17** | **0.566** | **0.551** | **0.554** | **0.093** | **0.934** | **0.868** | **0.476** |
+| heuristic after v17 | 0.360 | 0.350 | 0.402 | 0.188 | 0.931 | 0.874 | 0.476 |
+
+The heuristic keeps its old pronoun-reuse behavior (the unique-narration rule is
+opt-in for the scene engine), so its attribution is unchanged.  Character
+precision gives up 0.006 because the stricter attribution surfaces a few more
+gender-matched minor speakers; recall and gender accuracy do not regress.  The
+scene engine runs the tag pass twice (broad discovery + strict attribution),
+which adds about 0.1 s per book.
 
 ## Unnamed speakers (v10)
 

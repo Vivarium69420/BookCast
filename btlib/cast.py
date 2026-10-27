@@ -225,6 +225,12 @@ def _strip_interjection(name: str) -> str:
 # more often the *addressee* ("Jeremy," she said.).
 _SELF_INTRO_RE = re.compile(
     r'^[\s"“”\'‘’]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)[\s,.;:!?"“”\'‘’]*$')
+# "Hi, Lulu, I'm Willem." / "My name is Willem." — the same signal as a
+# name-only quote, but embedded in an ordinary sentence.  Only names already
+# present in the cast are accepted, so "I'm fine" cannot create a speaker.
+_SELF_INTRO_SAY_RE = re.compile(
+    r"\b(?:I['’]?m|I am|my name['’]?s|my name is)\s+"
+    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b")
 
 # Fallback for action-beat attribution with no speech verb at all
 # ('Lowen crossed her arms. "Fine."') — extremely common in contemporary
@@ -291,11 +297,22 @@ def _iter_name_tags(text: str):
 
 
 def self_introduced_name(text: str, name_to_root: dict, root_to_id: dict) -> Optional[str]:
-    """A 2+-word quote that is exactly a known character's name -> that speaker."""
-    m = _SELF_INTRO_RE.match(text)
-    if not m:
-        return None
-    return root_to_id.get(name_to_root.get(m.group(1).strip()))
+    """A quote that names the speaker -> that speaker.
+
+    Handles both the name-only form (``"Amanda Thomas," she says.``) and the
+    ordinary self-introduction (``"Hi, I'm Willem."``).  The latter matters at
+    a character's first appearance, before any narration has tagged them: the
+    scene engine would otherwise alternate the line onto whoever else happens
+    to be present, often a character of the wrong gender.
+    """
+    for m in (_SELF_INTRO_RE.match(text), _SELF_INTRO_SAY_RE.search(text)):
+        if not m:
+            continue
+        name = m.group(1).strip().rstrip(".,;:!?")
+        cid = root_to_id.get(name_to_root.get(name))
+        if cid:
+            return cid
+    return None
 
 
 def _gender_hint(text: str) -> Optional[str]:
@@ -344,6 +361,14 @@ def minor_gender(segments: List[tuple], seg_idx: int) -> Optional[str]:
 
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _CAP_WORD_RE = re.compile(r"\b[A-Z][a-z]+\b")
+# A name after one of these is an object/mention, not the subject of an action
+# beat ("... hit on Melanie?").  The action-beat pass has no verb to anchor it,
+# so this is the cheapest way to keep nearby mentions from becoming speakers.
+_ACTION_BEAT_PREP_RE = re.compile(
+    r"\b(?:on|at|to|with|for|about|from|of|in|into|like|as|by|near|behind|"
+    r"beside|around|toward|towards|over|under|after|before|during|without|"
+    r"against|among|between)\s+$",
+    re.IGNORECASE)
 # "Mary said, her voice low." / "Mary looked up and she smiled." — a subject
 # pronoun *after* a name in the same sentence is a much sharper gender signal
 # than pronouns anywhere in the sentence.
@@ -469,7 +494,9 @@ def _context_snippets(segments: List[tuple], seg_idx: int,
 
 
 def _tag_dialogue_segments(segments: List[tuple], midsentence_caps: set,
-                           pronouns: bool = True) -> Dict[int, Tuple[Optional[str], str, str]]:
+                           pronouns: bool = True,
+                           strict_action_beats: bool = False,
+                           unique_pronoun_narration: bool = False) -> Dict[int, Tuple[Optional[str], str, str]]:
     """Find who's speaking for every dialogue segment in a chapter's
     segment list: {seg_idx: (raw_name_or_None, snippet, method)}.
 
@@ -510,22 +537,57 @@ def _tag_dialogue_segments(segments: List[tuple], midsentence_caps: set,
         # With no verb to anchor it, this is the pass most exposed to capturing
         # an ordinary capitalized word, so it keeps the mid-sentence-cap
         # corroboration check and rejects anything containing a speech verb
-        # (which kills chapter headings like "Anne Says Her Prayers").  Only the
-        # sentence touching the quote is considered.
-        cands = [n for n in BARE_NAME_RE.findall(s)
-                 if _valid_name(n) and n.split()[0] in midsentence_caps]
+        # (which kills chapter headings like "Anne Says Her Prayers").
+        #
+        # Cast discovery deliberately stays liberal: a name mentioned in the
+        # narrator's thoughts still helps us learn the cast.  Attribution uses
+        # the strict form, where only the sentence touching the quote and a
+        # plausible subject count (a name several sentences away is usually a
+        # mention, not an action beat).
+        if not strict_action_beats:
+            cands = [n for n in BARE_NAME_RE.findall(s)
+                     if _valid_name(n) and n.split()[0] in midsentence_caps]
+            return pick(cands, prefer_last)
+
+        parts = [p.strip() for p in _SENT_SPLIT_RE.split(s.strip()) if p.strip()]
+        if not parts:
+            return None
+        sentence = parts[-1] if prefer_last else parts[0]
+        # A question immediately before/after a quote is narration addressed
+        # to the reader, not an action beat naming the speaker.
+        if sentence.endswith("?"):
+            return None
+        cands = []
+        for n in BARE_NAME_RE.findall(sentence):
+            if not _valid_name(n) or n.split()[0] not in midsentence_caps:
+                continue
+            idx = sentence.find(n)
+            if idx < 0:
+                continue
+            # "hit on Melanie" / "looked at Mary" -> object, not speaker.
+            if _ACTION_BEAT_PREP_RE.search(sentence[:idx].rstrip()):
+                continue
+            # A sentence that is just the name ("Louise. I like that.") is a
+            # quoted word, not an action beat.  Require some other prose.
+            rest = sentence[:idx] + " " + sentence[idx + len(n):]
+            if not re.search(r"[a-z]", rest):
+                continue
+            cands.append(n)
         return pick(cands, prefer_last)
 
-    def run_pass(matcher, method, consume=True):
+    def run_pass(matcher, method, consume=True, skip=None):
         for seg_idx in dialogue_idxs:
             if seg_idx in results:
                 continue
-            for narr_idx, snippet, prefer_last in _context_snippets(segments, seg_idx, consumed_narration):
+            blocked = consumed_narration | (skip or set())
+            for narr_idx, snippet, prefer_last in _context_snippets(segments, seg_idx, blocked):
                 match = matcher(snippet, prefer_last)
                 if match:
                     results[seg_idx] = (match, snippet, method)
                     if consume:
                         consumed_narration.add(narr_idx)
+                    elif skip is not None:
+                        skip.add(narr_idx)
                     break
 
     run_pass(tag_matcher, "tag")
@@ -533,8 +595,11 @@ def _tag_dialogue_segments(segments: List[tuple], midsentence_caps: set,
     if pronouns:
         # Runs before the bare-name pass (a pronoun tag is stronger evidence
         # than a name merely being nearby) but does not consume the narration:
-        # it must not starve the pass that discovers characters.
-        run_pass(pronoun_matcher, "pronoun", consume=False)
+        # it must not starve the pass that discovers characters.  It still
+        # tracks the narration it used, so "she moans" cannot tag both the
+        # quote before it and an unrelated quote after it.
+        pronoun_used = set() if unique_pronoun_narration else None
+        run_pass(pronoun_matcher, "pronoun", consume=False, skip=pronoun_used)
     run_pass(bare_name_matcher, "action-beat")
 
     for seg_idx in dialogue_idxs:
