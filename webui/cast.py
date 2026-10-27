@@ -91,18 +91,14 @@ def apply(
     c = find(data, cid)
     if not c:
         return False, f"unknown character id: {cid}"
-    if name is not None and name.strip():
-        c["name"] = name.strip()
-    if pitch is not None and pitch.strip():
-        c["pitch"] = pitch.strip()
-    if gender is not None:
-        c["gender"] = gender or None
     if voice is not None and voice.strip():
         voice = voice.strip()
         # Two named characters sharing a voice is almost never intentional:
         # the narrator and a major character become indistinguishable, and
         # every attribution mistake sounds like a voice bug.  Buckets may
         # share a fallback voice, and pitch can still distinguish them.
+        # Validate before mutating anything, so a rejected edit cannot leave
+        # a half-applied name/gender change in the in-memory cast.
         if cid not in UNKNOWN_IDS:
             owner = next((o for o in characters(data)
                           if o["id"] != cid and o["id"] not in UNKNOWN_IDS
@@ -111,6 +107,13 @@ def apply(
                 return False, (f"voice `{voice}` is already used by "
                                f"{owner.get('name') or owner['id']} ({owner['id']}); "
                                "pick another or use Auto")
+    if name is not None and name.strip():
+        c["name"] = name.strip()
+    if pitch is not None and pitch.strip():
+        c["pitch"] = pitch.strip()
+    if gender is not None:
+        c["gender"] = gender or None
+    if voice is not None and voice.strip():
         c["voice"] = voice
     return True, "applied"
 

@@ -246,10 +246,13 @@ class DuplicateVoiceTests(unittest.TestCase):
             ],
             "attribution": {},
         }
-        ok, msg = webcast.apply(data, "c2", voice="voice-a")
+        ok, msg = webcast.apply(
+            data, "c2", name="Changed", gender="male", voice="voice-a")
         self.assertFalse(ok)
         self.assertIn("already used", msg)
         self.assertEqual(data["characters"][1]["voice"], "voice-b")
+        self.assertEqual(data["characters"][1]["name"], "Melanie")
+        self.assertNotIn("gender", data["characters"][1])
 
 
 if __name__ == "__main__":
