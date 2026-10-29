@@ -31,7 +31,7 @@ from . import cast as base
 from .extract import split_dialogue_narration
 from .models import Book
 
-SCENE_VERSION = 10
+SCENE_VERSION = 11
 
 # A narration gap longer than this (characters) is treated as a scene break.
 SCENE_GAP = 500
@@ -145,10 +145,11 @@ def analyze_book_scene(book: Book, max_characters: int = 12,
         # the two separate avoids losing a character whose name only appears
         # in a narrator aside while still refusing that mention as a speaker.
         tags = base._tag_dialogue_segments(
-            segments, midsentence_caps, unique_pronoun_narration=True)
+            segments, midsentence_caps, unique_pronoun_narration=True,
+            paragraph_scoped=True)
         strict_tags = base._tag_dialogue_segments(
             segments, midsentence_caps, strict_action_beats=True,
-            unique_pronoun_narration=True)
+            unique_pronoun_narration=True, paragraph_scoped=True)
         for seg_idx, (kind, text) in enumerate(segments):
             if kind != "dialogue":
                 continue
@@ -295,9 +296,12 @@ def analyze_book_scene(book: Book, max_characters: int = 12,
                             if raw_name != base.NARRATOR_SENTINEL:
                                 minor_mentions[raw_name] += 1
 
-                    if character_id is None or character_id in ("minor_m", "minor_f"):
+                    if character_id in (None, "unknown", "minor_m", "minor_f"):
                         # '"Amanda Thomas," she says.' — a quote that is just a
                         # full name identifies the speaker even without a name tag.
+                        # The same applies when a nearby object mention already
+                        # put this line in the Unknown bucket: the quote itself
+                        # is stronger evidence than the mention.
                         cid = base.self_introduced_name(text, name_to_root, root_to_id)
                         if cid:
                             character_id, confidence, method = cid, "medium", "self-intro"

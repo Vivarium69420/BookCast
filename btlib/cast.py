@@ -26,7 +26,7 @@ from .models import Book
 from .names import name_gender
 from .tts import VOICE_BANK
 
-HEURISTIC_VERSION = 17  # bump whenever the attribution logic changes meaningfully
+HEURISTIC_VERSION = 18  # bump whenever the attribution logic changes meaningfully
 
 # Past tense AND present tense (base + third-person -s) — a book that
 # mixes tenses (present-tense scenes are common for flashbacks, dream
@@ -45,6 +45,8 @@ _SPEECH_VERB_STEMS = [
     "confessed", "agreed", "noted", "offered", "suggested", "urged",
     "pleaded", "begged", "ordered", "commanded", "scolded", "chided",
     "breathed", "panted", "wheezed", "finished", "concluded", "quipped",
+    "told", "explained", "responded", "acknowledged", "confided",
+    "prompted", "pressed", "questioned", "reminded",
 ]
 _PRESENT_TENSE_VERBS = [
     "say", "says", "ask", "asks", "reply", "replies", "whisper", "whispers",
@@ -67,6 +69,10 @@ _PRESENT_TENSE_VERBS = [
     "begs", "order", "orders", "command", "commands", "scold", "scolds",
     "chide", "chides", "pant", "pants", "wheeze", "wheezes", "finish",
     "finishes", "conclude", "concludes", "quip", "quips",
+    "tell", "tells", "explain", "explains", "respond", "responds",
+    "acknowledge", "acknowledges", "confide", "confides", "prompt",
+    "prompts", "press", "presses", "question", "questions", "remind",
+    "reminds",
 ]
 SPEECH_VERBS = sorted(set(_SPEECH_VERB_STEMS + _PRESENT_TENSE_VERBS), key=len, reverse=True)
 _SPEECH_VERB_SET = {v.lower() for v in SPEECH_VERBS}
@@ -186,7 +192,10 @@ TAG_RE = re.compile(
 # invisible to TAG_RE, since "I" is deliberately excluded from _NAME to
 # avoid noise everywhere else. Matched separately and mapped to a dedicated
 # "narrator" pseudo-character rather than folded into Unknown.
-NARRATOR_TAG_RE = re.compile(rf'\bI\s+(?:{_VERBS})\b|\b(?:{_VERBS})\s+I\b')
+NARRATOR_TAG_RE = re.compile(
+    rf"\bI(?:['\u2019]d|\s+had)?\s+(?:{_VERBS})\b"
+    rf"|\b(?:{_VERBS})\s+I\b"
+)
 NARRATOR_SENTINEL = "\u0000NARRATOR"  # never collides with a real captured name
 
 # Pronoun-only tags: '"..." she says.' / '"..." said he.'  Extremely common,
@@ -197,7 +206,7 @@ PRONOUN_TAG_M = "\u0000HE"
 PRONOUN_TAG_F = "\u0000SHE"
 PRONOUN_SENTINELS = (PRONOUN_TAG_M, PRONOUN_TAG_F)
 _PRONOUN_TAG_RE = re.compile(
-    rf'\b(he|she)\s+(?:{_VERBS})\b'                       # he said
+    rf"\b(he|she)(?:['\u2019]d|\s+had)?\s+(?:{_VERBS})\b"  # he said / he'd said
     rf'|\b(?:{_VERBS})\s+(he|she)\b'                      # said she
     rf'|\b(?:hear|heard|listening to|listened to)\s+(him|her)\b'  # I hear her mumble
     rf'|\b(?:his|her)\s+(?:mumble|murmur|reply|response|retort|whisper|answer|voice)\b',
@@ -286,9 +295,21 @@ def _collect_midsentence_caps(book: Book) -> set:
     return found
 
 
+_SUBJECT_BEFORE_VERB_RE = re.compile(
+    r"(?:\b(?:I|we|you|he|she|they|it)\b|[A-Z][a-z]+)\s*$")
+
+
 def _iter_name_tags(text: str):
     for m in TAG_RE.finditer(text):
         name = (m.group("name1") or m.group("name2") or "").strip()
+        # "I tell Willem" / "I asked Mary" is the narrator addressing someone,
+        # not Willem/Mary speaking.  The verb-before-name form is only a tag
+        # when the verb has no subject of its own ("said Mary", "then asked
+        # Mary"); a subject pronoun or a preceding name makes the following
+        # name the object.
+        if m.group("name2"):
+            if _SUBJECT_BEFORE_VERB_RE.search(text[:m.start()]):
+                continue
         # Strip before validating: a lead-in interjection otherwise makes the
         # whole capture fail ("Goddammit Barron" -> rejected, name lost).
         name = _strip_interjection(name)
@@ -323,6 +344,19 @@ def _gender_hint(text: str) -> Optional[str]:
     if female and female > male:
         return "female"
     return None
+
+
+def _action_beat_name_ok(sentence: str, name: str, idx: int) -> bool:
+    """Reject possessive mentions such as ``Melanie's family``.
+
+    Possessives are descriptions, never the actor of the sentence.  Ordinary
+    object mentions are deliberately kept: PDNC still gains from action beats
+    like ``I looked at Mary.`` even though they are ambiguous.  Prepositional
+    mentions (``with Melanie``, ``at Melanie``) are handled separately by
+    ``_ACTION_BEAT_PREP_RE``.
+    """
+    tail = sentence[idx + len(name):]
+    return not tail.lstrip().startswith(("'s", "\u2019s"))
 
 
 # "the man said" / "said the old woman" — a gendered descriptor next to an
@@ -367,7 +401,7 @@ _CAP_WORD_RE = re.compile(r"\b[A-Z][a-z]+\b")
 _ACTION_BEAT_PREP_RE = re.compile(
     r"\b(?:on|at|to|with|for|about|from|of|in|into|like|as|by|near|behind|"
     r"beside|around|toward|towards|over|under|after|before|during|without|"
-    r"against|among|between)\s+$",
+    r"against|among|between)\s*$",
     re.IGNORECASE)
 # "Mary said, her voice low." / "Mary looked up and she smiled." — a subject
 # pronoun *after* a name in the same sentence is a much sharper gender signal
@@ -472,7 +506,8 @@ SNIPPET_CHARS = 160
 
 
 def _context_snippets(segments: List[tuple], seg_idx: int,
-                      consumed_narration: set) -> List[Tuple[int, str, bool]]:
+                      consumed_narration: set,
+                      paragraph_scoped: bool = False) -> List[Tuple[int, str, bool]]:
     """(narration_index, snippet, prefer_last) triples for the narration right
     after, then right before, a dialogue segment — 'after' preferred since the
     tag-follows-quote convention dominates. ``prefer_last`` is True for the
@@ -482,21 +517,33 @@ def _context_snippets(segments: List[tuple], seg_idx: int,
     snippets = []
     if seg_idx + 1 < len(segments) and segments[seg_idx + 1][0] == "narration" and (seg_idx + 1) not in consumed_narration:
         after = segments[seg_idx + 1][1]
-        # A narration that *starts* a new paragraph is the next speaker's cue
-        # ("... ?"  /blank line/  "Barron answers this question."), not a tag
-        # for the quote before the break.  It still serves as the preceding
-        # context of the next quote.
-        if not after.lstrip(" \t").startswith("\n\n"):
+        # Only the first paragraph can tag the quote before it.  A later
+        # paragraph is a new beat for a later quote: "Surprise. And relief."
+        # /blank line/ "And then Willem says..." tags the *next* line, not the
+        # one before the blank line.  A leading blank line likewise means this
+        # is the next speaker's cue, not a tag for the quote before the break.
+        if paragraph_scoped:
+            first_para = re.split(r"\n[ \t]*\n", after, maxsplit=1)[0]
+            if first_para.strip():
+                snippets.append((seg_idx + 1, _clip_head(first_para, SNIPPET_CHARS), False))
+        elif not after.lstrip(" \t").startswith("\n\n"):
             snippets.append((seg_idx + 1, _clip_head(after, SNIPPET_CHARS), False))
     if seg_idx - 1 >= 0 and segments[seg_idx - 1][0] == "narration" and (seg_idx - 1) not in consumed_narration:
-        snippets.append((seg_idx - 1, _clip_tail(segments[seg_idx - 1][1], SNIPPET_CHARS), True))
+        before = segments[seg_idx - 1][1]
+        if paragraph_scoped:
+            last_para = re.split(r"\n[ \t]*\n", before)[-1]
+            if last_para.strip():
+                snippets.append((seg_idx - 1, _clip_tail(last_para, SNIPPET_CHARS), True))
+        else:
+            snippets.append((seg_idx - 1, _clip_tail(before, SNIPPET_CHARS), True))
     return snippets
 
 
 def _tag_dialogue_segments(segments: List[tuple], midsentence_caps: set,
                            pronouns: bool = True,
                            strict_action_beats: bool = False,
-                           unique_pronoun_narration: bool = False) -> Dict[int, Tuple[Optional[str], str, str]]:
+                           unique_pronoun_narration: bool = False,
+                           paragraph_scoped: bool = False) -> Dict[int, Tuple[Optional[str], str, str]]:
     """Find who's speaking for every dialogue segment in a chapter's
     segment list: {seg_idx: (raw_name_or_None, snippet, method)}.
 
@@ -567,6 +614,8 @@ def _tag_dialogue_segments(segments: List[tuple], midsentence_caps: set,
             # "hit on Melanie" / "looked at Mary" -> object, not speaker.
             if _ACTION_BEAT_PREP_RE.search(sentence[:idx].rstrip()):
                 continue
+            if not _action_beat_name_ok(sentence, n, idx):
+                continue
             # A sentence that is just the name ("Louise. I like that.") is a
             # quoted word, not an action beat.  Require some other prose.
             rest = sentence[:idx] + " " + sentence[idx + len(n):]
@@ -580,7 +629,8 @@ def _tag_dialogue_segments(segments: List[tuple], midsentence_caps: set,
             if seg_idx in results:
                 continue
             blocked = consumed_narration | (skip or set())
-            for narr_idx, snippet, prefer_last in _context_snippets(segments, seg_idx, blocked):
+            for narr_idx, snippet, prefer_last in _context_snippets(
+                    segments, seg_idx, blocked, paragraph_scoped=paragraph_scoped):
                 match = matcher(snippet, prefer_last)
                 if match:
                     results[seg_idx] = (match, snippet, method)

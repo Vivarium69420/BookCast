@@ -19,7 +19,7 @@ engine is both **more accurate** and **much faster** than the HMM:
 | LitBank | whole | 0.260 | 0.288 | 0.450 | 0.4 s |
 
 These are the original pre-scorer-fix numbers.  Current corrected PDNC numbers
-and the v17 first-appearance changes are in `EVAL.md`.
+and the v17/v18 attribution changes are in `EVAL.md`.
 
 ## How it works
 
@@ -61,6 +61,19 @@ and the v17 first-appearance changes are in `EVAL.md`.
    say "he"/"she", a recently-heard minor keeps the turn.  This is how an
    unnamed character ("I think she's right," he says) gets a male voice before
    the book reveals his name.
+
+7. **Paragraph-scoped tags (v18).** The scene engine only lets the paragraph
+   adjacent to a quote tag it: the first paragraph after the quote and the last
+   paragraph before it.  A name in an earlier or later paragraph no longer
+   bleeds across a blank line.  This is scene-engine only; the legacy heuristic
+   keeps the old paragraph-wide window so its PDNC score stays flat.
+
+   The same pass also recognises contracted tags (`I'd asked`, `he'd said`),
+   more speech verbs (`tell/tells`, `explain(s)`, `respond(s)`, ...), and
+   rejects verb-before-name matches that already have a subject (`I tell
+   Willem` is the narrator speaking, not Willem).  Possessive and prepositional
+   action beats (`with Melanie's family`, `looked at Melanie`) are no longer
+   treated as the speaker.
 
 ## Shared improvements this work also landed
 

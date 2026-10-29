@@ -28,8 +28,9 @@ from .cast import analyze_book, cast_path_for
 
 # Bumped whenever the cast schema or the cache-key inputs change. v17 adds the
 # LLM reconciliation / weak-line adjudication engine and stores its usage;
-# v18 adds the first-appearance/gender fallbacks in the scene engine.
-CAST_VERSION = 18
+# v18 adds the first-appearance/gender fallbacks in the scene engine; v19 adds
+# paragraph-scoped tags and the expanded speech-verb/contraction handling.
+CAST_VERSION = 19
 
 
 # --------------------------------------------------------------------------

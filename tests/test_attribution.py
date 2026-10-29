@@ -221,6 +221,83 @@ class FirstAppearanceTests(unittest.TestCase):
             segments, {"Louise", "Lulu"}, strict_action_beats=True)
         self.assertIsNone(strict[1][0])
 
+    def test_tag_in_previous_paragraph_does_not_bleed_forward(self):
+        segments = [
+            ("narration", "Willem says there is another station nearby.\n\n"),
+            ("dialogue", "“I can just drag it behind me.”"),
+            ("narration", " I’m joking.\n\n"),
+        ]
+        strict = castlib._tag_dialogue_segments(
+            segments, {"Willem"}, strict_action_beats=True,
+            paragraph_scoped=True)
+        self.assertIsNone(strict[1][0])
+
+    def test_later_paragraph_after_quote_does_not_tag_it(self):
+        segments = [
+            ("dialogue", "“Oh.”"),
+            ("narration", " Surprise. And relief.\n\nAnd then Willem says, "
+                          "ever so casually, "),
+            ("dialogue", "“We just fell in love once.”"),
+        ]
+        strict = castlib._tag_dialogue_segments(
+            segments, {"Willem"}, strict_action_beats=True,
+            paragraph_scoped=True)
+        self.assertIsNone(strict[0][0])
+        self.assertEqual(strict[2][0], "Willem")
+
+    def test_action_beat_rejects_possessive_and_prepositional_mentions(self):
+        for beat in ("I sat with Melanie’s family.\n\n",
+                     "I looked at Melanie.\n\n"):
+            segments = [
+                ("narration", beat),
+                ("dialogue", "“No.”"),
+            ]
+            strict = castlib._tag_dialogue_segments(
+                segments, {"Melanie"}, strict_action_beats=True)
+            self.assertIsNone(strict[1][0], beat)
+
+    def test_paragraph_scoped_action_beat_skips_trailing_blank_line(self):
+        segments = [
+            ("narration", "I drag Melanie out of bed.\n\n"),
+            ("dialogue", "“No.”"),
+        ]
+        strict = castlib._tag_dialogue_segments(
+            segments, {"Melanie"}, strict_action_beats=True,
+            paragraph_scoped=True)
+        self.assertIsNone(strict[1][0])
+
+    def test_action_beat_accepts_main_clause_subject(self):
+        segments = [
+            ("dialogue", "“We can walk.”"),
+            ("narration", "\n\nWe head back. Before we get to the doors, "
+                          "Willem turns to me and asks, "),
+            ("dialogue", "“Are you ready for Paris?”"),
+        ]
+        strict = castlib._tag_dialogue_segments(
+            segments, {"Willem"}, strict_action_beats=True)
+        self.assertIsNone(strict[0][0])
+        self.assertEqual(strict[2][0], "Willem")
+
+    def test_narrator_contraction_tags_the_speaker(self):
+        segments = [
+            ("dialogue", "“What’s this?”"),
+            ("narration", " I’d asked. We were sitting at the kitchen table. "),
+        ]
+        strict = castlib._tag_dialogue_segments(
+            segments, set(), strict_action_beats=True)
+        self.assertEqual(strict[0][0], castlib.NARRATOR_SENTINEL)
+        self.assertEqual(strict[0][2], "narrator")
+
+    def test_i_tell_name_does_not_make_name_the_speaker(self):
+        segments = [
+            ("dialogue", "“She’s new to this hangover thing.”"),
+            ("narration", " I tell Willem. "),
+        ]
+        strict = castlib._tag_dialogue_segments(
+            segments, {"Willem"}, strict_action_beats=True)
+        self.assertEqual(strict[0][0], castlib.NARRATOR_SENTINEL)
+        self.assertEqual(strict[0][2], "narrator")
+
     def test_unnamed_male_pronoun_gets_male_minor_voice(self):
         book = Book(title="Tiny", chapters=[Chapter(title="One", text=(
             "Melanie and Allyson stood by the door, fanning themselves. "

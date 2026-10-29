@@ -256,6 +256,56 @@ gender-matched minor speakers; recall and gender accuracy do not regress.  The
 scene engine runs the tag pass twice (broad discovery + strict attribution),
 which adds about 0.1 s per book.
 
+## Paragraph-scoped tags and missing speech verbs (v18)
+
+The scene engine used to read the last 160 characters of the preceding
+narration and the first 160 of the following narration, even when those windows
+crossed a blank line.  That made a tag in one paragraph attribute a quote in the
+next one: `Willem says there's another station.` in the chapter intro could
+claim the first line of dialogue, and `Surprise. And relief.` /blank line/
+`And then Willem says...` could claim the line *before* the blank line.  The
+scene engine now uses only the paragraph adjacent to the quote: the first
+paragraph after it and the last paragraph before it.  A tag in an earlier or
+later paragraph no longer bleeds across.
+
+Three related fixes ship with it:
+
+- **Missing speech verbs.**  `tell/tells`, `explain(s)`, `respond(s)`,
+  `acknowledge(s)`, `confide(s)`, `prompt(s)`, `press(es)`, `question(s)` and
+  `remind(s)` are now tags.  `Willem tells me.` used to fall through to
+  alternation; it now names Willem.
+- **Contracted narrator/pronoun tags.**  `I'd asked`, `I'd said`, `he'd said`
+  and `she'd replied` are recognised.  This matters in flashbacks, where the
+  narration often uses past perfect instead of simple past.
+- **Verb-before-name needs no subject.**  `I tell Willem.` is the narrator
+  speaking *to* Willem, not Willem speaking.  The verb-before-name form is only
+  a tag when the verb has no subject of its own (`said Mary`, `then asked
+  Mary`).
+- **Object mentions are not action beats.**  Possessive and prepositional
+  mentions (`with Melanie's family`, `looked at Melanie`) no longer make
+  Melanie the speaker of the nearest quote.  Ordinary subject mentions still
+  work, because PDNC relies on them.
+- **Self-introductions win over Unknown.**  `"Actually, my name is Allyson."`
+  now overrides a nearby object mention that had already put the line in the
+  Unknown bucket.
+
+The paragraph-scoped context is scene-engine only; the legacy heuristic keeps
+the old paragraph-wide window so its score does not move.
+
+Measured on all 28 PDNC novels with the corrected scorer:
+
+| PDNC (28) | attr(given) | attr(e2e) | back-and-forth | unknown | gender | charP | charR |
+|-----------|-------------|-----------|----------------|---------|--------|-------|-------|
+| scene after v17 | 0.566 | 0.551 | 0.554 | 0.093 | 0.934 | 0.868 | 0.476 |
+| **scene after v18** | **0.572** | **0.557** | **0.559** | **0.087** | **0.934** | **0.870** | **0.476** |
+| heuristic after v17 | 0.360 | 0.350 | 0.402 | 0.188 | 0.931 | 0.874 | 0.476 |
+| heuristic after v18 | 0.359 | 0.349 | 0.399 | 0.187 | 0.931 | 0.871 | 0.478 |
+
+The scene engine gains 0.006 on both attribution measures and 0.005 on
+back-and-forth while lowering Unknown.  The heuristic is flat within noise
+(-0.001), which is the intended trade: the new context rule is opt-in for the
+scene engine.
+
 ## Unnamed speakers (v10)
 
 Unresolved lines used to land in one genderless `Unknown` bucket, so an unnamed
