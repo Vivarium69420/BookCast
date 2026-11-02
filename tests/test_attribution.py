@@ -331,6 +331,19 @@ class DuplicateVoiceTests(unittest.TestCase):
         self.assertEqual(data["characters"][1]["name"], "Melanie")
         self.assertNotIn("gender", data["characters"][1])
 
+    def test_narrator_voice_cannot_be_reused(self):
+        data = {
+            "characters": [
+                {"id": "narrator", "name": "Narrator (I)", "voice": "voice-a"},
+                {"id": "c1", "name": "Allyson", "voice": "voice-b"},
+            ],
+            "attribution": {},
+        }
+        ok, msg = webcast.apply(data, "c1", voice="voice-a")
+        self.assertFalse(ok)
+        self.assertIn("already used", msg)
+        self.assertEqual(data["characters"][1]["voice"], "voice-b")
+
 
 if __name__ == "__main__":
     unittest.main()

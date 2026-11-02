@@ -12,6 +12,9 @@ from btlib.extract import split_dialogue_narration
 from . import store
 
 UNKNOWN_IDS = {"unknown", "minor_f", "minor_m", "narrator"}
+# Buckets may share a fallback voice; the narrator's voice is a real
+# assignment and must stay unique so narration never sounds like a character.
+VOICE_LOCKED_IDS = {"narrator"}
 
 
 # ---------------------------------------------------------------- load / save
@@ -99,9 +102,11 @@ def apply(
         # share a fallback voice, and pitch can still distinguish them.
         # Validate before mutating anything, so a rejected edit cannot leave
         # a half-applied name/gender change in the in-memory cast.
-        if cid not in UNKNOWN_IDS:
+        if cid not in UNKNOWN_IDS or cid in VOICE_LOCKED_IDS:
             owner = next((o for o in characters(data)
-                          if o["id"] != cid and o["id"] not in UNKNOWN_IDS
+                          if o["id"] != cid
+                          and (o["id"] not in UNKNOWN_IDS
+                               or o["id"] in VOICE_LOCKED_IDS)
                           and (o.get("voice") or "") == voice), None)
             if owner:
                 return False, (f"voice `{voice}` is already used by "
