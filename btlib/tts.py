@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import List, Optional
 
 
-EDGE_REQUEST_TIMEOUT = 60.0
+EDGE_REQUEST_TIMEOUT = 240.0
 
 
 async def _edge_tts_synthesize(text: str, voice: str, out_path: Path, rate: str, pitch: str = "+0Hz"):
