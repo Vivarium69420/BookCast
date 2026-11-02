@@ -4,10 +4,15 @@ from pathlib import Path
 from typing import List, Optional
 
 
+EDGE_REQUEST_TIMEOUT = 60.0
+
+
 async def _edge_tts_synthesize(text: str, voice: str, out_path: Path, rate: str, pitch: str = "+0Hz"):
     import edge_tts
     communicate = edge_tts.Communicate(text, voice=voice, rate=rate, pitch=pitch)
-    await communicate.save(str(out_path))
+    # A stalled websocket can otherwise hang a worker forever.  The retry
+    # wrapper in pipeline.py treats a timeout like any other failed attempt.
+    await asyncio.wait_for(communicate.save(str(out_path)), timeout=EDGE_REQUEST_TIMEOUT)
 
 
 def synth_chunk_edge(text: str, voice: str, out_path: Path, rate: str = "+0%", pitch: str = "+0Hz"):
