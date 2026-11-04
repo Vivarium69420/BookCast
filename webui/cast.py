@@ -11,10 +11,15 @@ from btlib.extract import split_dialogue_narration
 
 from . import store
 
-UNKNOWN_IDS = {"unknown", "minor_f", "minor_m", "narrator"}
-# Buckets may share a fallback voice; the narrator's voice is a real
-# assignment and must stay unique so narration never sounds like a character.
-VOICE_LOCKED_IDS = {"narrator"}
+NARRATOR_ID = "narrator"
+NARRATOR_NAME = "Narrator (I)"
+BUCKET_IDS = {"unknown", "minor_f", "minor_m"}
+# The narrator is a real cast member for editing, but it never speaks a
+# dialogue quote.  Buckets may share a fallback voice; the narrator's voice is
+# reserved so narration never sounds like a character.
+NON_DIALOGUE_IDS = BUCKET_IDS | {NARRATOR_ID}
+UNKNOWN_IDS = BUCKET_IDS
+VOICE_LOCKED_IDS = {NARRATOR_ID}
 
 
 # ---------------------------------------------------------------- load / save
@@ -23,20 +28,59 @@ def load(ws: Path) -> Optional[Dict[str, Any]]:
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    ensure_narrator_entry(data)
+    return data
 
 
 def save(ws: Path, data: Dict[str, Any]) -> Path:
     p = store.cast_path(ws)
     if p.exists():
         shutil.copy2(p, p.with_suffix(".json.bak"))
+    ensure_narrator_entry(data)
     recount(data)
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(p)
     return p
+
+
+def ensure_narrator_entry(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Keep the narrator as a normal, editable character entry.
+
+    Older casts only stored the narrator voice in a top-level ``narrator``
+    field, which made it invisible to the editor.  Materialise that field as a
+    zero-line character and keep the two copies in sync.
+    """
+    narrator = find(data, NARRATOR_ID)
+    if narrator is None and data.get("narrator"):
+        characters = data.setdefault("characters", [])
+        narrator = {
+            "id": NARRATOR_ID,
+            "name": NARRATOR_NAME,
+            "aliases": [],
+            "person": "first",
+            "narrator": True,
+            "gender": None,
+            "line_count": 0,
+        }
+        characters.insert(0, narrator)
+    if narrator is not None:
+        narrator["name"] = narrator.get("name") or NARRATOR_NAME
+        narrator["narrator"] = True
+        narrator["line_count"] = 0
+        if narrator.get("voice"):
+            data["narrator"] = narrator["voice"]
+        elif data.get("narrator"):
+            narrator["voice"] = data["narrator"]
+    return narrator
+
+
+def narrator_voice(data: Dict[str, Any]) -> str:
+    narrator = find(data, NARRATOR_ID)
+    return str((narrator or {}).get("voice") or data.get("narrator") or "")
 
 
 def recount(data: Dict[str, Any]) -> None:
@@ -59,9 +103,16 @@ def find(data: Dict[str, Any], cid: str) -> Optional[Dict[str, Any]]:
     return next((c for c in characters(data) if c["id"] == cid), None)
 
 
+def ordered_characters(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Cast-table order: narrator first, then by line count."""
+    return sorted(characters(data),
+                  key=lambda c: (0 if c.get("id") == NARRATOR_ID else 1,
+                                 -(c.get("line_count") or 0)))
+
+
 def characters_rows(data: Dict[str, Any]) -> List[List[Any]]:
     rows = []
-    for c in sorted(characters(data), key=lambda x: -(x.get("line_count") or 0)):
+    for c in ordered_characters(data):
         rows.append([
             c["id"],
             c.get("name") or "",
@@ -75,8 +126,8 @@ def characters_rows(data: Dict[str, Any]) -> List[List[Any]]:
 
 def character_names(data: Dict[str, Any], include_buckets: bool = False) -> List[str]:
     out = []
-    for c in sorted(characters(data), key=lambda x: -(x.get("line_count") or 0)):
-        if not include_buckets and c["id"] in UNKNOWN_IDS:
+    for c in ordered_characters(data):
+        if not include_buckets and c["id"] in NON_DIALOGUE_IDS:
             continue
         out.append(f"{c['id']}\t{c.get('name') or c['id']} ({c.get('line_count', 0)})")
     return out
@@ -96,22 +147,31 @@ def apply(
         return False, f"unknown character id: {cid}"
     if voice is not None and voice.strip():
         voice = voice.strip()
-        # Two named characters sharing a voice is almost never intentional:
-        # the narrator and a major character become indistinguishable, and
-        # every attribution mistake sounds like a voice bug.  Buckets may
-        # share a fallback voice, and pitch can still distinguish them.
+        # The narrator's voice is reserved for narration.  No dialogue
+        # character — named or bucket — may take it, and the narrator may not
+        # take a voice that any character already uses.  Named characters may
+        # also not duplicate each other; buckets may still share a fallback.
         # Validate before mutating anything, so a rejected edit cannot leave
         # a half-applied name/gender change in the in-memory cast.
-        if cid not in UNKNOWN_IDS or cid in VOICE_LOCKED_IDS:
+        reserved = narrator_voice(data)
+        owner = None
+        if cid == NARRATOR_ID:
             owner = next((o for o in characters(data)
                           if o["id"] != cid
-                          and (o["id"] not in UNKNOWN_IDS
-                               or o["id"] in VOICE_LOCKED_IDS)
                           and (o.get("voice") or "") == voice), None)
-            if owner:
-                return False, (f"voice `{voice}` is already used by "
-                               f"{owner.get('name') or owner['id']} ({owner['id']}); "
+        else:
+            if reserved and voice == reserved:
+                return False, (f"voice `{voice}` is reserved for the narrator; "
                                "pick another or use Auto")
+            if cid not in BUCKET_IDS:
+                owner = next((o for o in characters(data)
+                              if o["id"] != cid
+                              and o["id"] not in BUCKET_IDS
+                              and (o.get("voice") or "") == voice), None)
+        if owner:
+            return False, (f"voice `{voice}` is already used by "
+                           f"{owner.get('name') or owner['id']} ({owner['id']}); "
+                           "pick another or use Auto")
     if name is not None and name.strip():
         c["name"] = name.strip()
     if pitch is not None and pitch.strip():
@@ -127,6 +187,9 @@ def auto_voice(data: Dict[str, Any], gender: str, exclude_cid: Optional[str] = N
                profile: Optional[str] = None) -> Optional[str]:
     pool = store.voices_for_gender(gender, profile)
     used = {c.get("voice") for c in characters(data) if c["id"] != exclude_cid}
+    reserved = narrator_voice(data)
+    if reserved and exclude_cid != NARRATOR_ID:
+        used.add(reserved)
     for v in pool:
         if v not in used:
             return v
@@ -136,8 +199,8 @@ def auto_voice(data: Dict[str, Any], gender: str, exclude_cid: Optional[str] = N
 def merge(data: Dict[str, Any], src: str, dst: str) -> Tuple[bool, str]:
     if src == dst:
         return False, "cannot merge a character into itself"
-    if src in UNKNOWN_IDS or dst in UNKNOWN_IDS:
-        return False, "cannot merge bucket ids"
+    if src in NON_DIALOGUE_IDS or dst in NON_DIALOGUE_IDS:
+        return False, "cannot merge the narrator or bucket ids"
     if not find(data, src) or not find(data, dst):
         return False, "unknown character id"
     n = 0
@@ -152,8 +215,8 @@ def merge(data: Dict[str, Any], src: str, dst: str) -> Tuple[bool, str]:
 
 
 def delete(data: Dict[str, Any], cid: str) -> Tuple[bool, str]:
-    if cid in UNKNOWN_IDS:
-        return False, "cannot delete a bucket"
+    if cid in NON_DIALOGUE_IDS:
+        return False, "cannot delete the narrator or a bucket"
     if not find(data, cid):
         return False, "unknown character id"
     n = 0
@@ -187,7 +250,7 @@ def quote_rows(data: Dict[str, Any], chapter_key: str, text: str,
             continue
         cid = e.get("character_id")
         conf = e.get("confidence") or ""
-        if only_uncertain and not (conf == "low" or cid in UNKNOWN_IDS):
+        if only_uncertain and not (conf == "low" or cid in BUCKET_IDS):
             continue
         rows.append([
             seg_idx,
@@ -298,6 +361,33 @@ def validate_import(data: Any, book=None, current: Optional[Dict[str, Any]] = No
         genders[cid] = str(c.get("gender") or "")
     if "unknown" not in names:
         problems.append("No `unknown` bucket; every attribution needs somewhere to fall back to.")
+
+    # Voice collisions are data bugs, not style choices: the narrator must be
+    # distinguishable from every speaking character.  Check imports too, since
+    # a Colab/heavy cast bypasses the per-row editor.
+    narrator_voice = next((str(c.get("voice") or "") for c in chars
+                           if isinstance(c, dict) and c.get("id") == NARRATOR_ID), "")
+    narrator_voice = narrator_voice or str(data.get("narrator") or "")
+    named_voice_owner: Dict[str, str] = {}
+    for c in chars:
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("id")
+        voice = str(c.get("voice") or "")
+        if not cid or not voice:
+            continue
+        if cid == NARRATOR_ID:
+            continue
+        if narrator_voice and voice == narrator_voice:
+            problems.append(f"Voice `{voice}` is reserved for the narrator but is used by `{cid}`.")
+        if cid not in BUCKET_IDS:
+            owner = named_voice_owner.get(voice)
+            if owner:
+                # A large cast can exhaust the profile; pitch still separates
+                # the rows, so this is a warning rather than a failed import.
+                warnings.append(f"Voice `{voice}` is shared by `{owner}` and `{cid}`.")
+            else:
+                named_voice_owner[voice] = cid
 
     att = data.get("attribution")
     if not isinstance(att, dict):

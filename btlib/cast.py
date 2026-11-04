@@ -197,6 +197,8 @@ NARRATOR_TAG_RE = re.compile(
     rf"|\b(?:{_VERBS})\s+I\b"
 )
 NARRATOR_SENTINEL = "\u0000NARRATOR"  # never collides with a real captured name
+NARRATOR_ID = "narrator"
+NARRATOR_NAME = "Narrator (I)"
 
 # Pronoun-only tags: '"..." she says.' / '"..." said he.'  Extremely common,
 # and previously invisible — the line then fell through to alternation and
@@ -971,15 +973,83 @@ def _same_gender_candidate(gender: Optional[str], candidates: List[str],
     return None
 
 
+def ensure_narrator_character(characters: List[dict],
+                              narrator_gender: Optional[str] = None) -> Optional[dict]:
+    """Add a dedicated, zero-line narrator entry to a freshly built cast.
+
+    A named first-person protagonist also speaks dialogue, so narrating in
+    that character's voice makes prose and speech indistinguishable.  The
+    pseudo-character gives the pipeline a separate, editable narration voice.
+    """
+    narrator = next((c for c in characters if c.get("id") == NARRATOR_ID), None)
+    if narrator is not None:
+        narrator["name"] = NARRATOR_NAME
+        narrator["narrator"] = True
+        narrator["line_count"] = 0
+        narrator.setdefault("person", "first")
+        if narrator_gender:
+            narrator["gender"] = narrator_gender
+        return narrator
+
+    first_person = next((c for c in characters
+                         if c.get("narrator") or c.get("person") == "first"), None)
+    if first_person is None:
+        return None
+    # If the first-person speaker had no discoverable name, the engine already
+    # named that character "Narrator (I)".  Reusing the name would produce two
+    # indistinguishable rows; leave the existing cast alone rather than guess.
+    if ((first_person.get("name") or "") == NARRATOR_NAME
+            and (first_person.get("line_count") or 0) > 0):
+        return None
+
+    narrator = {
+        "id": NARRATOR_ID,
+        "name": NARRATOR_NAME,
+        "aliases": [],
+        "person": "first",
+        "narrator": True,
+        "gender": narrator_gender or first_person.get("gender"),
+        "line_count": 0,
+    }
+    insert_at = next((i for i, c in enumerate(characters)
+                      if c.get("id") in ("minor_f", "minor_m", "unknown")),
+                     len(characters))
+    characters.insert(insert_at, narrator)
+    return narrator
+
+
 def assign_voices(characters: List[dict]):
     """Pick a voice + pitch for each discovered character, grouped by
     inferred gender, cycling the voice bank and nudging pitch once a pool
-    is exhausted so characters stay distinguishable even in a large cast."""
+    is exhausted so characters stay distinguishable even in a large cast.
+
+    The narrator gets the top voice in the profile and that voice is reserved:
+    no character may be assigned it, so narration never sounds like dialogue.
+    """
     counters = {"male": 0, "female": 0, "neutral": 0}
     pitch_options = ["+0Hz", "+10Hz", "-10Hz", "+20Hz", "-20Hz"]
     used = set()
+    reserved = None
+    narrator = next((c for c in characters if c.get("id") == NARRATOR_ID), None)
+    if narrator is not None:
+        gender = narrator.get("gender") or "neutral"
+        if gender not in counters:
+            gender = "neutral"
+        pool = VOICE_BANK.get(gender) or VOICE_BANK["neutral"]
+        if pool:
+            reserved = pool[0]
+            used.add(reserved)
+            narrator["voice"] = reserved
+            narrator["pitch"] = "+0Hz"
+            # Start this gender one slot in so the first same-gender character
+            # gets the next voice instead of a reserved collision.
+            counters[gender] = 1
     for ch in characters:
+        if ch is narrator:
+            continue
         gender = ch.get("gender") or "neutral"
+        if gender not in counters:
+            gender = "neutral"
         pool = VOICE_BANK.get(gender) or VOICE_BANK["neutral"]
         i = counters[gender]
         counters[gender] += 1
@@ -998,6 +1068,14 @@ def assign_voices(characters: List[dict]):
             if free:
                 voice = free[0]
                 pitched = True
+            elif reserved and voice == reserved:
+                # The profile is exhausted.  Reuse another character's voice
+                # with a pitch shift rather than ever reusing the narrator's.
+                everywhere = [v for vs in VOICE_BANK.values() for v in vs]
+                alternatives = [v for v in everywhere if v != reserved]
+                if alternatives:
+                    voice = alternatives[0]
+                    pitched = True
         used.add(voice)
         ch["voice"] = voice
         steps = (i // len(pool)) + (1 if pitched else 0)

@@ -341,8 +341,100 @@ class DuplicateVoiceTests(unittest.TestCase):
         }
         ok, msg = webcast.apply(data, "c1", voice="voice-a")
         self.assertFalse(ok)
-        self.assertIn("already used", msg)
+        self.assertIn("reserved for the narrator", msg)
         self.assertEqual(data["characters"][1]["voice"], "voice-b")
+
+    def test_minor_bucket_cannot_take_narrator_voice(self):
+        data = {
+            "characters": [
+                {"id": "narrator", "name": "Narrator (I)", "voice": "voice-a"},
+                {"id": "minor_f", "name": "Unnamed woman (minor)", "voice": "voice-b"},
+            ],
+            "attribution": {},
+        }
+        ok, msg = webcast.apply(data, "minor_f", voice="voice-a")
+        self.assertFalse(ok)
+        self.assertIn("reserved for the narrator", msg)
+        self.assertEqual(data["characters"][1]["voice"], "voice-b")
+
+    def test_narrator_cannot_take_a_character_voice(self):
+        data = {
+            "characters": [
+                {"id": "narrator", "name": "Narrator (I)", "voice": "voice-a"},
+                {"id": "c1", "name": "Allyson", "voice": "voice-b"},
+                {"id": "minor_m", "name": "Unnamed man (minor)", "voice": "voice-c"},
+            ],
+            "attribution": {},
+        }
+        ok, msg = webcast.apply(data, "narrator", voice="voice-c")
+        self.assertFalse(ok)
+        self.assertIn("already used", msg)
+        self.assertEqual(data["characters"][0]["voice"], "voice-a")
+
+
+class NarratorCastTests(unittest.TestCase):
+    def test_narrator_entry_is_added_and_voice_reserved(self):
+        characters = [
+            {"id": "c1", "name": "Allyson", "gender": "female",
+             "narrator": True, "person": "first", "line_count": 803},
+            {"id": "c2", "name": "Willem", "gender": "male", "line_count": 580},
+            {"id": "c3", "name": "Melanie", "gender": "female", "line_count": 220},
+            {"id": "minor_f", "name": "Unnamed woman (minor)",
+             "gender": "female", "line_count": 0},
+            {"id": "minor_m", "name": "Unnamed man (minor)",
+             "gender": "male", "line_count": 0},
+            {"id": "unknown", "name": "Unknown / Minor Characters",
+             "gender": None, "line_count": 0},
+        ]
+        narrator = castlib.ensure_narrator_character(characters)
+        self.assertIsNotNone(narrator)
+        self.assertEqual(narrator["id"], "narrator")
+        self.assertEqual(narrator["name"], "Narrator (I)")
+        self.assertEqual(narrator["line_count"], 0)
+        castlib.assign_voices(characters)
+        narrator_voice = narrator["voice"]
+        self.assertTrue(narrator_voice)
+        self.assertNotIn(narrator_voice,
+                         [c["voice"] for c in characters if c is not narrator])
+
+    def test_character_rows_pin_narrator_first(self):
+        data = {
+            "characters": [
+                {"id": "c1", "name": "Allyson", "line_count": 803, "voice": "a"},
+                {"id": "narrator", "name": "Narrator (I)", "line_count": 0, "voice": "b"},
+            ],
+            "attribution": {},
+        }
+        rows = webcast.characters_rows(data)
+        self.assertEqual(rows[0][0], "narrator")
+
+    def test_old_top_level_narrator_becomes_an_editable_row(self):
+        data = {
+            "characters": [
+                {"id": "c1", "name": "Allyson", "line_count": 803, "voice": "a"},
+            ],
+            "narrator": "voice-n",
+            "attribution": {},
+        }
+        narrator = webcast.ensure_narrator_entry(data)
+        self.assertIsNotNone(narrator)
+        self.assertEqual(narrator["id"], "narrator")
+        self.assertEqual(narrator["voice"], "voice-n")
+        self.assertEqual(narrator["line_count"], 0)
+
+    def test_import_rejects_narrator_voice_collision(self):
+        data = {
+            "characters": [
+                {"id": "narrator", "name": "Narrator (I)", "voice": "voice-a"},
+                {"id": "c1", "name": "Allyson", "voice": "voice-a"},
+                {"id": "unknown", "name": "Unknown / Minor Characters", "voice": "voice-u"},
+            ],
+            "narrator": "voice-a",
+            "attribution": {},
+        }
+        ok, problems, _summary = webcast.validate_import(data)
+        self.assertFalse(ok)
+        self.assertTrue(any("reserved for the narrator" in p for p in problems))
 
 
 if __name__ == "__main__":

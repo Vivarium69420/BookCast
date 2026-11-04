@@ -419,7 +419,8 @@ def _cast_note(session: Optional[Dict[str, Any]] = None) -> str:
     cast = session.get("cast")
     if cast:
         return (f"Loaded saved cast ({len(cast.get('characters', []))} characters) · "
-                f"{castlib.source_label(cast)}.")
+                f"{castlib.source_label(cast)}. The **Narrator (I)** row is editable; "
+                "its voice is reserved and cannot be reused by a character.")
     return "No cast yet — press **Analyze cast**."
 
 
@@ -1262,7 +1263,7 @@ def on_cast_select(evt: gr.SelectData):
         row = int(row)
     except (TypeError, ValueError):
         return (gr.update(),) * 7
-    ordered = sorted(castlib.characters(S["cast"]), key=lambda x: -(x.get("line_count") or 0))
+    ordered = castlib.ordered_characters(S["cast"])
     if not (0 <= row < len(ordered)):
         return (gr.update(),) * 7
     c = ordered[row]
@@ -1273,7 +1274,7 @@ def on_cast_select(evt: gr.SelectData):
 def on_row_number(row):
     if not S["cast"] or not row:
         return (gr.update(),) * 6
-    ordered = sorted(castlib.characters(S["cast"]), key=lambda x: -(x.get("line_count") or 0))
+    ordered = castlib.ordered_characters(S["cast"])
     i = int(row) - 1
     if not (0 <= i < len(ordered)):
         return (gr.update(),) * 6

@@ -75,7 +75,9 @@ def voice_profile_for(kind: str, args) -> dict:
 def first_person_narration_voice(args, char_by_id: dict):
     if getattr(args, "voice", None):
         return None
-    narrator = next((c for c in char_by_id.values() if c.get("name") == "Narrator (I)"), None)
+    narrator = next((c for c in char_by_id.values()
+                      if c.get("id") == "narrator" or c.get("name") == "Narrator (I)"),
+                     None)
     return (narrator or {}).get("voice") or None
 
 

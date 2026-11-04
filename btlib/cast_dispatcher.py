@@ -24,13 +24,15 @@ from pathlib import Path
 from typing import Optional
 
 from . import tts
-from .cast import analyze_book, cast_path_for
+from .cast import (analyze_book, assign_voices, cast_path_for,
+                   ensure_narrator_character)
 
 # Bumped whenever the cast schema or the cache-key inputs change. v17 adds the
 # LLM reconciliation / weak-line adjudication engine and stores its usage;
 # v18 adds the first-appearance/gender fallbacks in the scene engine; v19 adds
-# paragraph-scoped tags and the expanded speech-verb/contraction handling.
-CAST_VERSION = 19
+# paragraph-scoped tags and the expanded speech-verb/contraction handling;
+# v20 adds an editable, voice-reserved narrator to generated casts.
+CAST_VERSION = 20
 
 
 # --------------------------------------------------------------------------
@@ -118,7 +120,7 @@ def _build_cast(book, args, mode: str) -> dict:
         from .cast_llm import analyze_book_llm
 
         max_calls = getattr(args, "llm_max_calls", None)
-        return analyze_book_llm(
+        data = analyze_book_llm(
             book,
             max_characters=max_characters,
             model=getattr(args, "llm_model", None) or "llama3:8b",
@@ -132,38 +134,44 @@ def _build_cast(book, args, mode: str) -> dict:
             strict=bool(getattr(args, "analyze_only", False)),
             progress=bool(getattr(args, "analyze_only", False)),
         )
-
-    if mode == "light":
+    elif mode == "light":
         from .cast_light import analyze_book_light
 
-        return analyze_book_light(
+        data = analyze_book_light(
             book,
             max_characters=max_characters,
             narrator_gender=narrator_gender,
         )
-
-    if mode == "whole":
+    elif mode == "whole":
         from .cast_whole import analyze_book_whole
 
-        return analyze_book_whole(
+        data = analyze_book_whole(
             book,
             max_characters=max_characters,
             unknown_below=getattr(args, "unknown_below", None),
             narrator_gender=narrator_gender,
         )
-
-    if mode == "scene":
+    elif mode == "scene":
         from .cast_scene import analyze_book_scene
 
-        return analyze_book_scene(
+        data = analyze_book_scene(
             book,
             max_characters=max_characters,
             unknown_below=getattr(args, "unknown_below", None),
             narrator_gender=narrator_gender,
         )
+    else:
+        data = analyze_book(book, max_characters=max_characters)
+        data["mode"] = "heuristic"
 
-    data = analyze_book(book, max_characters=max_characters)
-    data["mode"] = "heuristic"
+    # Add a dedicated narrator row (for first-person books) and reserve the
+    # top-priority voice for it.  Reassigning here is safe: this is a fresh
+    # analysis, so no manual voice edits exist yet.  It also covers engines
+    # that assigned voices before we injected the narrator.
+    narrator = ensure_narrator_character(data.get("characters", []), narrator_gender)
+    if narrator is not None:
+        assign_voices(data["characters"])
+        data["narrator"] = narrator.get("voice")
     return data
 
 
