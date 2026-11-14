@@ -53,6 +53,7 @@ _PRESENT_TENSE_VERBS = [
     "shout", "shouts", "mutter", "mutters", "cry", "cries", "exclaim",
     "exclaims", "murmur", "murmurs", "call", "calls", "answer", "answers",
     "continue", "continues", "add", "adds", "interrupt", "interrupts",
+    "try", "tries", "tried",
     "yell", "yells", "snap", "snaps", "laugh", "laughs", "sigh", "sighs",
     "begin", "begins", "declare", "declares", "insist", "insists",
     "protest", "protests", "demand", "demands", "repeat", "repeats",
@@ -211,7 +212,7 @@ _PRONOUN_TAG_RE = re.compile(
     rf"\b(he|she)(?:['\u2019]d|\s+had)?\s+(?:{_VERBS})\b"  # he said / he'd said
     rf'|\b(?:{_VERBS})\s+(he|she)\b'                      # said she
     rf'|\b(?:hear|heard|listening to|listened to)\s+(him|her)\b'  # I hear her mumble
-    rf'|\b(?:his|her)\s+(?:mumble|murmur|reply|response|retort|whisper|answer|voice)\b',
+    rf'|\b(his|her)\s+(?:mumble|murmur|reply|response|retort|whisper|answer|voice)\b',
     re.IGNORECASE)
 
 # The tag regex happily glues a leading interjection onto a name

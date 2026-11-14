@@ -14,6 +14,7 @@ from pathlib import Path
 from btlib import cast as castlib
 from btlib.cast_llm import _apply_cast_updates, _apply_results
 from btlib.cast_scene import analyze_book_scene
+from btlib.extract import split_dialogue_narration
 from btlib.llm import LLMClient
 from btlib.models import Book, Chapter
 from webui import cast as webcast
@@ -312,6 +313,144 @@ class FirstAppearanceTests(unittest.TestCase):
         rows = {e["seg_idx"]: e for e in data["attribution"]["1"]}
         self.assertEqual(rows[5]["character_id"], "minor_m")
         self.assertEqual(rows[5]["method"], "pronoun-male")
+
+
+class SceneAttributionTests(unittest.TestCase):
+    """JOD-style family/class scenes that exercise the scene engine."""
+
+    _WARMUP = "".join(f"“Warmup {i},” I said.\n\n" for i in range(10))
+
+    def _scene(self, text):
+        book = Book(title="Tiny", chapters=[Chapter(title="One", text=text)])
+        data = analyze_book_scene(book, max_characters=10)
+        segments = split_dialogue_narration(text)
+        rows = {e["seg_idx"]: e for e in data["attribution"]["1"]}
+        chars = {c["id"]: c for c in data["characters"]}
+        by_quote = {}
+        for idx, (kind, part) in enumerate(segments):
+            if kind == "dialogue":
+                by_quote[part] = rows.get(idx, {})
+        return by_quote, chars
+
+    def _speaker(self, by_quote, chars, needle):
+        for quote, row in by_quote.items():
+            if needle in quote:
+                cid = row.get("character_id")
+                return chars.get(cid, {"name": cid, "id": cid})
+        self.fail(f"no quote containing {needle!r}")
+
+    def _assert_name(self, by_quote, chars, needle, name):
+        speaker = self._speaker(by_quote, chars, needle)
+        self.assertEqual(speaker.get("name"), name,
+                         f"{needle!r} -> {speaker}")
+
+    def test_four_person_family_tags_each_speaker(self):
+        text = self._WARMUP + (
+            "Grandma folded her napkin. “She’s not a child,” Grandma said.\n\n"
+            "“She’s still in school,” Mom said.\n\n"
+            "“I can decide for myself,” I said.\n\n"
+            "“Then decide,” Dad said.\n\n"
+            "“Don’t talk to your father that way,” Mom said.\n\n"
+            "“Let her speak,” Grandma said.\n\n"
+        )
+        by_quote, chars = self._scene(text)
+        self._assert_name(by_quote, chars, "not a child", "Grandma")
+        self._assert_name(by_quote, chars, "still in school", "Mom")
+        self.assertTrue(self._speaker(by_quote, chars,
+                                      "decide for myself").get("narrator"))
+        self._assert_name(by_quote, chars, "Then decide", "Dad")
+        self._assert_name(by_quote, chars, "father that way", "Mom")
+        self._assert_name(by_quote, chars, "Let her speak", "Grandma")
+
+    def test_paragraph_break_she_action_returns_to_mother(self):
+        text = self._WARMUP + (
+            "Mom set down her checkbook. “Paris is expensive,” Mom said.\n\n"
+            "“I know,” I said.\n\n"
+            "“You should take the car at night,” Mom said.\n\n"
+            "“That’s okay. I don’t want to leave you stranded,” I said.\n\n"
+            "“Well, call me for a ride,” Mom said.\n\n"
+            "“It’s late. And I usually get a lift home from someone.”\n\n"
+            "She takes the check back and with a violence that surprises me, "
+            "rips it up.\n\n"
+            "“Well, I can’t do anything for you anymore, can I?”\n\n"
+            "“What does that mean?”\n\n"
+            "“You don’t want my money or my car or my ride,” Mom said.\n\n"
+        )
+        by_quote, chars = self._scene(text)
+        self._assert_name(by_quote, chars, "anything for you anymore", "Mom")
+        self.assertTrue(self._speaker(by_quote, chars,
+                                      "What does that mean?").get("narrator"))
+        self._assert_name(by_quote, chars, "my money or my car", "Mom")
+
+    def test_cognition_beat_lets_narrator_reply(self):
+        text = self._WARMUP + (
+            "Mom set down her fork. “You never listen,” Mom said.\n\n"
+            "I don’t entirely believe her.\n\n"
+            "“If that’s true, maybe you should stop.”\n\n"
+            "“Am I wrong?” Mom asked.\n\n"
+        )
+        by_quote, chars = self._scene(text)
+        self.assertTrue(self._speaker(by_quote, chars,
+                                      "maybe you should stop").get("narrator"))
+        self._assert_name(by_quote, chars, "Am I wrong?", "Mom")
+
+    def test_rapid_grandma_exchange_keeps_narrator_turns(self):
+        text = self._WARMUP + (
+            "Mom smoothed her dress. “Paris is expensive,” Mom said.\n\n"
+            "“I know,” I said.\n\n"
+            "“Your mom is having such a hard time,” Grandma said.\n\n"
+            "“I don’t see why. She has a charmed life.”\n\n"
+            "“Funny, that’s what she says about you whenever she thinks "
+            "you’re being ungrateful.”\n\n"
+            "I spit out my lemonade.\n\n"
+            "“She’s forty-seven.”\n\n"
+            "“She could adopt.”\n\n"
+            "Grandma waves her hand.\n\n"
+            "“One of those Chinese orphans. Lucy Rosenbaum got a cute one as "
+            "a granddaughter.”\n\n"
+            "“They’re not dogs, Grandma!”\n\n"
+            "“I know that. Still, she could get an older one.”\n\n"
+            "“Did you tell Mom that?”\n\n"
+            "“Of course I did.”\n\n"
+        )
+        by_quote, chars = self._scene(text)
+        self._assert_name(by_quote, chars, "having such a hard time", "Grandma")
+        self.assertTrue(self._speaker(by_quote, chars,
+                                      "She has a charmed life").get("narrator"))
+        self.assertTrue(self._speaker(by_quote, chars,
+                                      "She’s forty-seven").get("narrator"))
+        self._assert_name(by_quote, chars, "She could adopt", "Grandma")
+        self._assert_name(by_quote, chars, "Chinese orphans", "Grandma")
+        self.assertTrue(self._speaker(by_quote, chars,
+                                      "They’re not dogs").get("narrator"))
+        self._assert_name(by_quote, chars, "I know that", "Grandma")
+        self.assertTrue(self._speaker(by_quote, chars,
+                                      "Did you tell Mom").get("narrator"))
+        self._assert_name(by_quote, chars, "Of course I did", "Grandma")
+
+    def test_french_class_lines_do_not_leak_to_parent(self):
+        text = self._WARMUP + (
+            "I am learning French this summer. Mom smoothed her dress. "
+            "“Paris is expensive,” Mom said.\n\n"
+            "“I know,” I said.\n\n"
+            "“Je m’appelle Thérèse Lambert,” the teacher said.\n\n"
+            "“Comment vous appelez-vous?” the teacher asked.\n\n"
+            "“Je m’appelle Allyson,” I said.\n\n"
+            "“Bravo! Enchantée, Allyson,” the teacher said.\n\n"
+            "“Pourquoi voulez-vous apprendre le français?” the teacher asked.\n\n"
+            "“Je veux apprendre le français parce que,” a girl whispered. "
+            "She raised her hand.\n\n"
+            "“Je veux apprendre le français parce que le divorce!”\n\n"
+            "“Excellent,” the teacher said.\n\n"
+        )
+        by_quote, chars = self._scene(text)
+        self.assertTrue(self._speaker(by_quote, chars,
+                                      "Je m’appelle Allyson").get("narrator"))
+        for needle in ("Thérèse Lambert", "Bravo! Enchantée",
+                       "le divorce!"):
+            speaker = self._speaker(by_quote, chars, needle)
+            self.assertIn(speaker.get("id"), ("minor_f", "minor_m"),
+                          f"{needle!r} -> {speaker}")
 
 
 class DuplicateVoiceTests(unittest.TestCase):
