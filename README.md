@@ -2,6 +2,12 @@
 
 Audiobook creator from EPUB/PDF with multi-voice character attribution and crash-resilient resuming.
 
+## BookCast website
+
+The product landing page is the static site in `site/` (brand: **BookCast**).
+Preview it with `python -m http.server 8765 -d site`, or see
+[`site/README.md`](site/README.md) for GitHub Pages deployment.
+
 ## Requirements
 
 - Python 3.9+
