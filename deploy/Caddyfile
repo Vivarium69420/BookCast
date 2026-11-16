@@ -1,0 +1,19 @@
+# BookCast reverse proxy.
+# DOMAIN, BASIC_AUTH_USER, and BASIC_AUTH_HASH come from .env via Compose.
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# The app has no built-in auth, so keep the whole studio private.
+	basic_auth {
+		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	}
+
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+
+	reverse_proxy app:7860
+}

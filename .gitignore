@@ -14,6 +14,10 @@ venv/
 books/
 runs/
 models/
+
+# VPS deployment data (books/audio, backups)
+data/
+backups/
 *.epub
 *.pdf
 *.mp3
@@ -32,3 +36,4 @@ book_to_audio_complete.zip
 # Secrets
 .env
 .env.*
+!.env.example

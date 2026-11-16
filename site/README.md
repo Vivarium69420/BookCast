@@ -16,10 +16,15 @@ Open <http://127.0.0.1:8765/>.
 ## Before deploying
 
 1. Set the public repository URL in `assets/config.js` so the **Source** links
-   appear. Leave it empty to hide them:
+   appear. Set `appUrl` to the hosted studio so the main CTAs open it instead
+   of jumping to the quickstart:
    ```js
-   window.BOOKCAST_CONFIG = { repoUrl: "https://github.com/your-name/bookcast" };
+   window.BOOKCAST_CONFIG = {
+     repoUrl: "https://github.com/your-name/bookcast",
+     appUrl: "https://app.your-domain.com"
+   };
    ```
+   Leave `appUrl` empty while the studio is not deployed.
 2. Replace the Open Graph image at `assets/og-card.png` if the copy changes.
    The editable source is `assets/og-card.svg`.
 3. Check `index.html` metadata and the footer wording for the final domain.
@@ -43,7 +48,7 @@ and update the workflow path.
 - `404.html` — branded not-found page
 - `assets/styles.css` — layout, type, color, responsive rules
 - `assets/app.js` — mobile nav, cast-line highlight, copy buttons, active nav
-- `assets/config.js` — deployment settings
+- `assets/config.js` — repository and hosted-app URLs
 - `assets/favicon.svg` — mark
 - `assets/og-card.svg` / `.png` — social preview
 - `robots.txt` — allow all crawlers

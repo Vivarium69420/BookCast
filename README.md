@@ -8,6 +8,20 @@ The product landing page is the static site in `site/` (brand: **BookCast**).
 Preview it with `python -m http.server 8765 -d site`, or see
 [`site/README.md`](site/README.md) for GitHub Pages deployment.
 
+## Run BookCast online
+
+GitHub Pages only serves the landing page. To accept real uploads and render
+requests, deploy the Gradio studio with Docker, Caddy, HTTPS, and basic auth:
+
+```bash
+cp .env.example .env
+# edit DOMAIN and BASIC_AUTH_HASH
+./deploy/setup.sh
+```
+
+See [`deploy/README.md`](deploy/README.md) for the full VPS setup, DNS,
+persistent storage, backups, updates, and security notes.
+
 ## Requirements
 
 - Python 3.9+

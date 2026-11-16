@@ -194,6 +194,23 @@
     });
   }
 
+  function setupAppLinks() {
+    var config = window.BOOKCAST_CONFIG || {};
+    var url = typeof config.appUrl === "string" ? config.appUrl.trim() : "";
+
+    if (!url) {
+      return;
+    }
+
+    doc.querySelectorAll("[data-app-link]").forEach(function (link) {
+      link.href = url;
+      if (/^https?:/i.test(url)) {
+        link.target = "_blank";
+        link.rel = "noopener";
+      }
+    });
+  }
+
   function setupActiveNav() {
     if (!("IntersectionObserver" in window)) {
       return;
@@ -250,6 +267,7 @@
     setupCastFilter();
     setupCopyButtons();
     setupRepoLinks();
+    setupAppLinks();
     setupActiveNav();
   });
 })();
