@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import secrets
 import shlex
 import socket
 import subprocess
@@ -21,7 +23,9 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import gradio as gr
+from fastapi import Depends, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -34,6 +38,14 @@ from webui import cast as castlib                           # noqa: E402
 from webui import params as pspec                           # noqa: E402
 from webui import preview, store                            # noqa: E402
 from webui.job import JobQueue, JobSpec                     # noqa: E402
+from webui.theme import (                                   # noqa: E402
+    ACTIVITY_HTML,
+    FOOTER_HTML,
+    HEAD,
+    HEADER_HTML,
+    RENDER_NOTE_HTML,
+    THEME,
+)
 
 MANAGER = JobQueue(slots=store.queue_slots())
 RUNTIME = store.runtime_settings()
@@ -67,11 +79,6 @@ CAST_SAVED_RE = re.compile(
 
 SUPPORTED_SUFFIXES = {".epub", ".pdf"}
 SESSION_FILE = ROOT / "runs" / "session.json"
-
-CSS = """
-.book-rail label { display: inline-block; margin-right: 18px; }
-.book-rail { min-height: 54px; }
-"""
 
 
 # --------------------------------------------------------------------------
@@ -952,6 +959,7 @@ def _workspace_values(status: Optional[str] = None,
             "",
             gr.update(visible=False),
             *_param_widget_values(session),
+            gr.update(open=True),
         ]
 
     cast = session.get("cast")
@@ -983,6 +991,7 @@ def _workspace_values(status: Optional[str] = None,
         "",
         gr.update(visible=False),
         *_param_widget_values(session),
+        gr.update(open=False),
     ]
 
 
@@ -2083,14 +2092,13 @@ def build_param_widget(p: pspec.Param):
                       info=p.help)
 
 
-with gr.Blocks(title="Book to Audio", css=CSS) as demo:
-    gr.Markdown("# Book to Audio\nOne page per open book; one shared Activity panel. "
-                "Renders continue when you switch books.")
+with gr.Blocks(title="BookCast Studio", theme=THEME, head=HEAD) as demo:
+    gr.HTML(HEADER_HTML, elem_classes=["bc-plain"])
 
-    with gr.Row():
+    with gr.Row(elem_classes=["bc-shell"]):
         # ------------------------------------------------------------ workspace
-        with gr.Column(scale=3, min_width=720):
-            with gr.Row():
+        with gr.Column(scale=3, min_width=720, elem_classes=["bc-workspace"]):
+            with gr.Row(elem_classes=["bc-library"]):
                 # A Dropdown with allow_custom_value keeps a newly opened book
                 # selectable even though Gradio validates Radio inputs against
                 # the choices the server component was built with.
@@ -2101,9 +2109,10 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                                          allow_custom_value=True, scale=4)
                 close_book_btn = gr.Button("Close book", scale=1)
 
-            with gr.Accordion("Open a book", open=False):
+            with gr.Accordion("Open a book", open=True,
+                              elem_classes=["bc-card", "bc-open-card"]) as open_book_accordion:
                 open_upload = gr.File(label="Upload EPUB / PDF", type="filepath",
-                                      file_types=[".epub", ".pdf"])
+                                      file_types=[".epub", ".pdf"], height=190)
                 open_path = gr.Textbox(
                     label="…or a path on disk",
                     value=_last_book_path(),
@@ -2112,13 +2121,19 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                 )
                 open_path_btn = gr.Button("Open path", variant="primary")
 
-            book_info = gr.Markdown("No book open. Use **Open a book** below.")
+            book_info = gr.Markdown(
+                "No book open yet. Open an EPUB or PDF above to build a cast, "
+                "review the chapters, and render.",
+                elem_classes=["bc-book-card"],
+            )
 
-            with gr.Accordion("Book & chapters", open=True):
+            with gr.Accordion("Book & chapters", open=True,
+                              elem_classes=["bc-card"]):
                 chapter_table = gr.Dataframe(
                     headers=["#", "Chapter", "Words", "Dialogue lines"],
                     datatype=["number", "str", "number", "number"],
-                    interactive=False, wrap=True, max_height=260)
+                    interactive=False, wrap=True, max_height=280,
+                    elem_classes=["bc-table"])
                 with gr.Row():
                     chapter_range = gr.Textbox(
                         label="Chapters to render", value="all", scale=3,
@@ -2130,16 +2145,19 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                 with gr.Row():
                     analyze_btn = gr.Button("Analyze cast (no TTS)", variant="secondary",
                                             scale=2)
-                gr.Markdown(
-                    "_High accuracy: start Ollama in the Colab notebook with the "
-                    "cloudflared tunnel, paste its `/api/generate` URL into **LLM "
-                    "endpoint**, choose `heavy`, then press **Analyze cast**. The "
-                    "analysis runs in **Activity** (no 15-minute timeout) and the cast "
-                    "updates here when it finishes. You can also import a Colab cast "
-                    "JSON in **Cast & quotes**._")
+                with gr.Accordion("High-accuracy analysis (optional)", open=False,
+                                  elem_classes=["bc-subcard"]):
+                    gr.Markdown(
+                        "_High accuracy: start Ollama in the Colab notebook with the "
+                        "cloudflared tunnel, paste its `/api/generate` URL into **LLM "
+                        "endpoint**, choose `heavy`, then press **Analyze cast**. The "
+                        "analysis runs in **Activity** (no 15-minute timeout) and the cast "
+                        "updates here when it finishes. You can also import a Colab cast "
+                        "JSON in **Cast & quotes**._")
                 book_status = gr.Markdown("")
 
-            with gr.Accordion("Parameters", open=False):
+            with gr.Accordion("Parameters", open=False,
+                              elem_classes=["bc-card"]):
                 gr.Markdown("_Runtime settings — TTS concurrency, failure policy, and "
                             "parallel slots — are in the Activity panel. Apply changes "
                             "here before rendering._")
@@ -2148,7 +2166,8 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                                if p.group == group and p.key not in HIDDEN_KEYS]
                     if not visible:
                         continue
-                    with gr.Accordion(group, open=(group in ("Voice", "Attribution"))):
+                    with gr.Accordion(group, open=(group in ("Voice", "Attribution")),
+                                      elem_classes=["bc-subcard"]):
                         for p in visible:
                             PARAM_COMPONENTS[p.key] = build_param_widget(p)
                             PARAM_ORDER.append(p.key)
@@ -2165,7 +2184,8 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                 confirm_params_btn = gr.Button("Confirm changes", variant="primary",
                                                visible=False)
 
-                with gr.Accordion("Presets", open=False):
+                with gr.Accordion("Presets", open=False,
+                                  elem_classes=["bc-subcard"]):
                     with gr.Row():
                         preset_dd = gr.Dropdown(label="Preset", choices=store.preset_names(),
                                                 value=None, allow_custom_value=True)
@@ -2175,11 +2195,13 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                         save_preset_btn = gr.Button("Save preset")
                     preset_status = gr.Markdown("")
 
-                with gr.Accordion("Command preview", open=False):
+                with gr.Accordion("Command preview", open=False,
+                                  elem_classes=["bc-subcard"]):
                     preview_btn = gr.Button("Show exact command")
                     cmd_preview = gr.Code(label="Command", interactive=False)
 
-            with gr.Accordion("Cast & quotes", open=False):
+            with gr.Accordion("Cast & quotes", open=False,
+                              elem_classes=["bc-card"]):
                 cast_note = gr.Markdown("Analyze a book first.")
                 with gr.Row():
                     cast_import = gr.File(label="Import cast JSON (Colab)", file_types=[".json"],
@@ -2193,7 +2215,8 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                         cast_table = gr.Dataframe(
                             headers=["id", "name", "lines", "gender", "voice", "pitch"],
                             datatype=["str", "str", "number", "str", "str", "str"],
-                            interactive=False, wrap=True, max_height=300)
+                            interactive=False, wrap=True, max_height=300,
+                            elem_classes=["bc-table"])
                         row_number = gr.Number(label="Row # (1-based)", precision=0, value=1)
                     with gr.Column(scale=2):
                         cid_box = gr.Textbox(label="Character id", interactive=False)
@@ -2219,7 +2242,7 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                             save_cast_btn = gr.Button("Save cast")
                             revert_btn = gr.Button("Revert to backup")
 
-                with gr.Accordion("Quotes", open=True):
+                with gr.Accordion("Quotes", open=True, elem_classes=["bc-subcard"]):
                     with gr.Row():
                         q_chapter = gr.Dropdown(label="Chapter", choices=[],
                                                 allow_custom_value=True)
@@ -2228,7 +2251,8 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                     q_table = gr.Dataframe(
                         headers=["seg", "speaker", "id", "method", "confidence", "text"],
                         datatype=["number", "str", "str", "str", "str", "str"],
-                        interactive=False, wrap=True, max_height=340)
+                        interactive=False, wrap=True, max_height=340,
+                        elem_classes=["bc-table"])
                     with gr.Row():
                         q_seg = gr.Number(label="Segment #", precision=0, value=0)
                         q_speaker = gr.Dropdown(label="Assign to", choices=[],
@@ -2236,11 +2260,14 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                         q_assign = gr.Button("Assign", variant="primary")
                     q_status = gr.Markdown("")
 
-            with gr.Accordion("Render this book", open=True):
+            with gr.Accordion("Render this book", open=True,
+                              elem_classes=["bc-card", "bc-render-card"]):
+                gr.HTML(RENDER_NOTE_HTML, elem_classes=["bc-plain"])
                 book_run_md = gr.Markdown("No book open.")
                 with gr.Row():
                     render_btn = gr.Button("Render / continue current book",
-                                           variant="primary", scale=3)
+                                           variant="primary", scale=3,
+                                           elem_classes=["bc-render-btn"])
                     start_over = gr.Checkbox(
                         label="Start over", value=False, scale=1,
                         info="Ignore saved chunks for this run only.")
@@ -2250,9 +2277,9 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                     value=False, visible=False)
 
         # ------------------------------------------------------------ activity
-        with gr.Column(scale=2, min_width=420):
-            gr.Markdown("## Activity\n_Shared by every open book._")
-            with gr.Accordion("Runtime", open=True):
+        with gr.Column(scale=2, min_width=420, elem_classes=["bc-activity"]):
+            gr.HTML(ACTIVITY_HTML, elem_classes=["bc-plain"])
+            with gr.Accordion("Runtime", open=True, elem_classes=["bc-card"]):
                 slots_dd = gr.Dropdown(label="Parallel renders", choices=[1, 2, 3],
                                        value=store.queue_slots(),
                                        info="How many books may render at once.")
@@ -2271,9 +2298,10 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                             "Changes apply to new jobs and **Continue**._")
 
             jobs_table = gr.Dataframe(
-                headers=["id", "book", "chapters", "state", "%", "elapsed", "output"],
+                headers=["id", "book", "range", "state", "%", "time", "out"],
                 datatype=["str", "str", "str", "str", "number", "str", "str"],
-                interactive=False, wrap=True, max_height=220)
+                interactive=False, wrap=True, max_height=240,
+                elem_classes=["bc-table"])
             with gr.Row():
                 job_pick = gr.Textbox(
                     label="Selected job (id or #)", scale=3,
@@ -2290,12 +2318,13 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
 
             run_status = gr.Markdown("Idle — queue empty.")
             progress = gr.Slider(0, 100, value=0, label="Progress", interactive=False)
-            log_box = gr.Textbox(label="Log", lines=14, max_lines=14, autoscroll=True)
+            log_box = gr.Textbox(label="Log", lines=14, max_lines=14, autoscroll=True,
+                                 elem_classes=["bc-log"])
             with gr.Row():
                 audio_out = gr.Audio(label="Output", type="filepath", interactive=False)
                 download_out = gr.File(label="Download")
 
-            with gr.Accordion("Share output", open=False):
+            with gr.Accordion("Share output", open=False, elem_classes=["bc-card"]):
                 gr.Markdown("### Google Drive\n_Uses your local `rclone` config._")
                 with gr.Row():
                     drive_remote = gr.Textbox(
@@ -2320,6 +2349,8 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
                 phone_status = gr.Markdown(
                     "_The phone must share your Wi-Fi or be on your Tailscale network._")
 
+    gr.HTML(FOOTER_HTML, elem_classes=["bc-plain"])
+
     # ------------------------------------------------------------- wiring
     PARAM_INPUTS = [PARAM_COMPONENTS[k] for k in PARAM_ORDER]
     WORKSPACE_OUTPUTS = [
@@ -2328,7 +2359,7 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
         extra_args, params_status, params_review, confirm_params_btn,
         book_run_md, render_warning, confirm_restart, start_over,
         cast_import_preview, cast_import_apply_btn,
-        *PARAM_INPUTS,
+        *PARAM_INPUTS, open_book_accordion,
     ]
     ACTIVITY_OUTPUTS = [job_pick, run_status, progress, log_box, audio_out, download_out]
     BOOK_OUTPUTS = [book_radio] + WORKSPACE_OUTPUTS + ACTIVITY_OUTPUTS
@@ -2448,8 +2479,32 @@ with gr.Blocks(title="Book to Audio", css=CSS) as demo:
     demo.load(_book_view, outputs=BOOK_OUTPUTS)
 
 
-def _share_route(slug: str):
+_SHARE_SECURITY = HTTPBasic(auto_error=False)
+
+
+def _share_authorized(credentials: Optional[HTTPBasicCredentials]) -> bool:
+    """Apply the optional BOOKCAST_USER/PASSWORD auth to /share too."""
+    expected = _launch_auth()
+    if not expected:
+        return True
+    if credentials is None:
+        return False
+    user, password = expected
+    return (
+        secrets.compare_digest(credentials.username, user)
+        and secrets.compare_digest(credentials.password, password)
+    )
+
+
+def _share_route(slug: str,
+                 credentials: Optional[HTTPBasicCredentials] = Depends(_SHARE_SECURITY)):
     """Serve a book's finished MP3 (or per-chapter zip) to a phone/browser."""
+    if not _share_authorized(credentials):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": 'Basic realm="BookCast"'},
+        )
     runs = store.RUNS.resolve()
     try:
         ws = (store.RUNS / slug).resolve()
@@ -2479,6 +2534,15 @@ def _register_share_route(app) -> None:
     _SHARE_ROUTE_ADDED = True
 
 
+def _launch_auth() -> Optional[tuple[str, str]]:
+    """Optional app-level basic auth for personal LAN/Termux hosting."""
+    user = (os.environ.get("BOOKCAST_USER") or "").strip()
+    password = os.environ.get("BOOKCAST_PASSWORD") or ""
+    if user and password:
+        return (user, password)
+    return None
+
+
 def main() -> None:
     import argparse as _argparse
     global SERVER_PORT, SERVER_HOST
@@ -2492,9 +2556,10 @@ def main() -> None:
     SERVER_HOST = a.host
     # Launch without blocking so we can add the phone-download route to the
     # FastAPI app Gradio only creates inside launch().
+    auth = _launch_auth()
     demo.launch(server_name=a.host, server_port=a.port, share=a.share,
-                inbrowser=not a.no_browser, show_error=True, max_file_size="2gb",
-                prevent_thread_lock=True)
+                auth=auth, inbrowser=not a.no_browser, show_error=True,
+                max_file_size="2gb", prevent_thread_lock=True)
     _register_share_route(demo.app)
     demo.block_thread()
 

@@ -22,6 +22,22 @@ cp .env.example .env
 See [`deploy/README.md`](deploy/README.md) for the full VPS setup, DNS,
 persistent storage, backups, updates, and security notes.
 
+## Run on a phone (Termux)
+
+The same studio runs on Android through Termux and opens as a local website.
+See [`deploy/TERMUX.md`](deploy/TERMUX.md). Quick start:
+
+```bash
+pkg install git
+git clone https://github.com/Vivarium69420/BookCast.git
+cd BookCast
+./deploy/termux-setup.sh
+./run_termux.sh
+```
+
+Then open `http://127.0.0.1:7860` on the phone, or the printed LAN address from
+another device on the same Wi-Fi.
+
 ## Requirements
 
 - Python 3.9+

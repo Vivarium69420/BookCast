@@ -4,6 +4,11 @@ This deploys the real Gradio studio — uploads, cast analysis, rendering, Activ
 
 The static marketing site can stay on GitHub Pages. Put the app on a subdomain such as `app.example.com`.
 
+## Hosting on a phone?
+
+If you only need personal use, Termux on Android can host the same studio as a
+local website without a VPS. See [`TERMUX.md`](TERMUX.md).
+
 ## What you need
 
 - A VPS: **2 vCPU / 2 GB RAM minimum**, 4 GB if you plan to use Kokoro or a local LLM. Audio files add up, so start with 20 GB+ disk.
@@ -206,6 +211,9 @@ docker compose restart app
 
 - The app is designed as a **single-user studio**, not a multi-tenant service. Basic auth protects one shared workspace; it does not isolate users from each other. Do not hand out accounts until per-user workspaces and ownership checks exist.
 - Use a long, unique password and keep `.env` at mode `600`.
+- Set `BOOKCAST_USER` and `BOOKCAST_PASSWORD` in `.env` if you want a second,
+  app-level prompt. It also protects the `/share/<book>` download links; Caddy
+  remains the outer layer.
 - Keep the host and Docker updated.
 - If you use Cloudflare in front, set SSL/TLS to **Full (strict)** after Caddy has a certificate.
 - Only upload books you have the right to convert.

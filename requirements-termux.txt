@@ -1,0 +1,13 @@
+# Termux / Android dependencies for the default Edge TTS studio.
+#
+# Kokoro and pyttsx3 are intentionally omitted: Kokoro needs onnxruntime and
+# numpy, and pyttsx3 needs a working espeak backend. The default engine is
+# edge-tts, which is all you need for phone hosting.
+#
+# Gradio itself requires numpy and pandas. Install Termux's prebuilt packages
+# first (see deploy/termux-setup.sh), then install this file.
+ebooklib>=0.18
+beautifulsoup4>=4.12
+pypdf>=4.0
+edge-tts>=6.1
+gradio>=5,<6

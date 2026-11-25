@@ -9,6 +9,10 @@ services:
     init: true
     environment:
       TZ: ${TZ:-UTC}
+      # Optional app-level basic auth in addition to Caddy. Leave empty to
+      # rely on Caddy only.
+      BOOKCAST_USER: ${BOOKCAST_USER:-}
+      BOOKCAST_PASSWORD: ${BOOKCAST_PASSWORD:-}
     volumes:
       - ./data/books:/app/books
       - ./data/runs:/app/runs
