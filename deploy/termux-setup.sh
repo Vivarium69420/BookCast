@@ -17,7 +17,7 @@ pkg update -y
 pkg upgrade -y
 
 echo "Installing system tools and prebuilt numeric packages..."
-pkg install -y python ffmpeg git qrencode
+pkg install -y python ffmpeg git
 pkg install -y termux-api || true
 pkg install -y python-numpy python-pandas || true
 

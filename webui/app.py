@@ -1891,6 +1891,19 @@ def _make_qr(url: str, slug: str) -> Optional[str]:
     except OSError:
         return None
     out_png = qdir / f"qr_{slug}.png"
+
+    # Prefer the pure-Python library: it works on Termux, in the Docker image,
+    # and on hosts without the qrencode CLI.
+    try:
+        import qrcode
+        qr = qrcode.QRCode(version=None, box_size=6, border=2)
+        qr.add_data(url)
+        qr.make(fit=True)
+        qr.make_image(fill_color="black", back_color="white").save(out_png)
+        return str(out_png)
+    except Exception:
+        pass
+
     try:
         subprocess.run(["qrencode", "-o", str(out_png), "-s", "6", "-m", "2", url],
                        check=True, capture_output=True, timeout=15)
@@ -1943,7 +1956,7 @@ def on_phone_link(selector, base_url, request: gr.Request = None):
     if alternates:
         lines.append("Other addresses to try: " + ", ".join(f"`{b}`" for b in alternates))
     if qr is None:
-        lines.append("_Could not build a QR (`qrencode` missing); use the URL above._")
+        lines.append("_Could not build a QR (install `qrcode[pil]`); use the URL above._")
     if SERVER_HOST in ("127.0.0.1", "localhost", "::1"):
         lines.append("⚠ The UI is bound to loopback, so your phone cannot reach it. "
                      "Restart with `./run_ui.sh --host 0.0.0.0` (or bind to your "
