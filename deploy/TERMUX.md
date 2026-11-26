@@ -157,6 +157,11 @@ proot route.
 
 **`ffmpeg: command not found`** — `pkg install ffmpeg`.
 
+**`Installing pip is forbidden`** — do not run `pip install --upgrade pip` in
+native Termux. Termux patches pip and blocks self-upgrades. Pull the latest
+`deploy/termux-setup.sh` and rerun it; it installs packages with the packaged
+pip without upgrading it.
+
 **`Address already in use`** — use another port:
 
 ```bash

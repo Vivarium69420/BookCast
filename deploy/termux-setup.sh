@@ -22,7 +22,10 @@ pkg install -y termux-api || true
 pkg install -y python-numpy python-pandas || true
 
 echo "Installing Python dependencies..."
-python -m pip install --upgrade pip
+# Termux's python-pip is patched and refuses to upgrade itself. Installing
+# packages with the packaged pip is fine; upgrading pip is what breaks it.
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+export PIP_NO_INPUT=1
 if ! python -m pip install -r requirements-termux.txt; then
   cat >&2 <<'EOF'
 
