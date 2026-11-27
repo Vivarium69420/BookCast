@@ -128,6 +128,7 @@ THEME = gr.themes.Base(
 
 CSS = r"""
 :root {
+  color-scheme: light;
   --bc-bg: #f3eee5;
   --bc-panel: #fffdf8;
   --bc-panel-2: #faf5ec;
@@ -169,6 +170,36 @@ body {
 ::selection {
   background: var(--bc-amber-soft);
   color: var(--bc-ink);
+}
+
+/* The studio is a light, paper-like workspace. Gradio follows the OS colour
+   scheme by default; if the browser reports dark mode, lock the dark palette
+   back to the paper palette so dropdowns, tables, checkboxes, and the command
+   preview do not turn into black rectangles. */
+:root body.dark,
+:root body.dark .gradio-container {
+  color-scheme: light !important;
+  --background-fill-primary: #fffdf8 !important;
+  --background-fill-secondary: #faf5ec !important;
+  --color-accent-soft: #e5f1eb !important;
+  --code-background-fill: #f5eddf !important;
+  --checkbox-background-color: #fffefb !important;
+  --checkbox-background-color-focus: #fffefb !important;
+  --checkbox-background-color-hover: #f5eddf !important;
+  --checkbox-border-color: #dcd0bd !important;
+  --table-row-focus: #e5f1eb !important;
+}
+
+:root body.dark .gradio-dataframe-standalone {
+  --df-background-fill-primary: #fffdf8 !important;
+  --df-background-fill-secondary: #faf5ec !important;
+  --df-body-text-color: #211d18 !important;
+  --df-block-background-fill: #fffdf8 !important;
+  --df-table-even-background-fill: #fffdf8 !important;
+  --df-table-odd-background-fill: #faf5ec !important;
+  --df-border-color-primary: #e3d8c7 !important;
+  --df-color-accent: #1f6f5c !important;
+  --df-color-accent-soft: #e5f1eb !important;
 }
 
 footer,
@@ -853,6 +884,48 @@ button.primary {
 }
 """
 
+# Gradio applies the OS dark class to <body> after the app mounts. The studio
+# is intentionally light-only, so remove that class and keep watching for it.
+# This is more reliable than trying to override every Gradio dark variable,
+# including the ones used by the standalone dataframe and code editor.
+LIGHT_MODE_JS = """
+<meta name="color-scheme" content="light">
+<script>
+(() => {
+  const forceLight = () => {
+    document.documentElement.classList.remove("dark");
+    document.documentElement.style.colorScheme = "light";
+    if (document.body) {
+      document.body.classList.remove("dark");
+      document.body.style.colorScheme = "light";
+    }
+  };
+
+  forceLight();
+  const observer = new MutationObserver(forceLight);
+  observer.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ["class"]
+  });
+
+  const observeBody = () => {
+    if (!document.body) return;
+    forceLight();
+    observer.observe(document.body, {
+      attributes: true,
+      attributeFilter: ["class"]
+    });
+  };
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", observeBody, { once: true });
+  } else {
+    observeBody();
+  }
+})();
+</script>
+"""
+
 # Inject globally rather than through Blocks.css, which scopes selectors to
 # the inner .contain element and cannot reach the page shell.
-HEAD = HEAD + "\n<style>\n" + CSS + "\n</style>\n"
+HEAD = HEAD + LIGHT_MODE_JS + "\n<style>\n" + CSS + "\n</style>\n"
