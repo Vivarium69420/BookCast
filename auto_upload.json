@@ -1,0 +1,17 @@
+{
+  "remote": "maihaidanga6:Audiobooks",
+  "poll_seconds": 20,
+  "stable_seconds": 45,
+  "jobs": [
+    {
+      "name": "Atlas of the Heart",
+      "workspace_glob": "runs/*atlas*of*the*heart*",
+      "remote_name": "Atlas of the Heart.mp3"
+    },
+    {
+      "name": "The Stars Don't Lie",
+      "workspace_glob": "runs/*stars*",
+      "remote_name": "The Stars Don't Lie.mp3"
+    }
+  ]
+}

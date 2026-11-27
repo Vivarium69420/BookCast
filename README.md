@@ -189,6 +189,24 @@ job is selected:
   the best local address; edit **Base URL** to your Tailscale `100.x` address to reach the phone
   away from home.
 
+### Auto-upload finished renders
+
+`auto_upload_to_drive.py` watches the workspaces listed in `auto_upload.json` and uploads each MP3
+to Drive once the render is complete. It waits for `progress.json` to report `final_done`, checks the
+file with `ffprobe`, uploads with `rclone copyto --checksum`, and records the uploaded size/mtime so
+restarting the watcher does not send the same file twice.
+
+```bash
+python auto_upload_to_drive.py              # keep watching
+python auto_upload_to_drive.py --once       # upload anything ready, then exit
+python auto_upload_to_drive.py --force      # re-upload even if unchanged
+```
+
+The default config watches **Atlas of the Heart** and **The Stars Don't Lie** and sends them to
+`maihaidanga6:Audiobooks`. Edit `auto_upload.json` to add another book or change the remote.
+Progress is logged to `runs/auto_upload.log`; the upload cache is
+`runs/.auto_upload_state.json`.
+
 The phone must be able to reach the Gradio server, so start it on the LAN/Tailscale interface:
 
 ```bash
